@@ -10,7 +10,7 @@ services:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - HOST=0.0.0.0
       - PORT=8000
-      - DEBUG=False
+      - DEBUG=${DEBUG:-False}
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-*}
     volumes:
       - .:/app
-    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload

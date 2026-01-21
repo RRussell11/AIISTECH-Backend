@@ -17,6 +17,9 @@ class Settings(BaseSettings):
     PORT: int = int(os.getenv("PORT", "8000"))
     DEBUG: bool = os.getenv("DEBUG", "False").lower() == "true"
     
+    # CORS Configuration
+    ALLOWED_ORIGINS: str = os.getenv("ALLOWED_ORIGINS", "*")
+    
     # AI Settings
     MAX_TOKENS: int = int(os.getenv("MAX_TOKENS", "2000"))
     TEMPERATURE: float = float(os.getenv("TEMPERATURE", "0.7"))

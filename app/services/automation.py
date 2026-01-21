@@ -2,7 +2,7 @@
 Automation service for handling automated tasks
 """
 import uuid
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from datetime import datetime
 
 
@@ -183,7 +183,7 @@ async def {endpoint_name}():
         """Get task by ID"""
         return self.tasks.get(task_id)
     
-    def list_tasks(self) -> list[Dict[str, Any]]:
+    def list_tasks(self) -> List[Dict[str, Any]]:
         """List all tasks"""
         return list(self.tasks.values())
 

@@ -2,10 +2,15 @@
 AI service for generating web designs
 """
 import os
+import logging
+from datetime import datetime
 from typing import Optional
 from openai import AsyncOpenAI
 from app.config import settings
 from app.models.schemas import DesignRequest, DesignStyle, ColorScheme
+
+# Configure logging
+logger = logging.getLogger(__name__)
 
 
 class AIDesignService:
@@ -55,7 +60,7 @@ class AIDesignService:
             return html, css
             
         except Exception as e:
-            print(f"Error generating design with AI: {e}")
+            logger.error(f"Error generating design with AI: {e}")
             return self._generate_fallback_design(request)
     
     def _build_design_prompt(self, request: DesignRequest) -> str:
@@ -161,7 +166,7 @@ CSS:
     </main>
     
     <footer>
-        <p>&copy; 2026 Your Company. All rights reserved.</p>
+        <p>&copy; {datetime.now().year} Your Company. All rights reserved.</p>
     </footer>
 </body>
 </html>"""
