@@ -306,3 +306,366 @@ func TestSiteIsolation(t *testing.T) {
 		t.Errorf("staging should have 0 events, got %d", len(events))
 	}
 }
+
+// --- Audit ---
+
+func TestListAudit_Empty(t *testing.T) {
+	t.Chdir(t.TempDir())
+	rr := do(t, newRouter(t), http.MethodGet, "/sites/local/audit", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	entries, ok := body["entries"].([]any)
+	if !ok {
+		t.Fatalf("entries field missing or wrong type: %v", body)
+	}
+	if len(entries) != 0 {
+		t.Errorf("expected 0 entries, got %d", len(entries))
+	}
+}
+
+func TestAuditAutoWritten(t *testing.T) {
+	t.Chdir(t.TempDir())
+	router := newRouter(t)
+
+	do(t, router, http.MethodPost, "/sites/local/events", []byte(`{"x":1}`))
+
+	rr := do(t, router, http.MethodGet, "/sites/local/audit", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	entries := body["entries"].([]any)
+	if len(entries) != 1 {
+		t.Errorf("expected 1 audit entry after POST event, got %d", len(entries))
+	}
+}
+
+func TestAuditEntryContent(t *testing.T) {
+	t.Chdir(t.TempDir())
+	router := newRouter(t)
+
+	do(t, router, http.MethodPost, "/sites/local/events", []byte(`{"x":1}`))
+
+	listRR := do(t, router, http.MethodGet, "/sites/local/audit", nil)
+	var listBody map[string]any
+	json.Unmarshal(listRR.Body.Bytes(), &listBody) //nolint:errcheck
+	entries := listBody["entries"].([]any)
+	if len(entries) == 0 {
+		t.Fatal("expected at least 1 audit entry")
+	}
+	filename := entries[0].(string)
+
+	getRR := do(t, router, http.MethodGet, "/sites/local/audit/"+filename, nil)
+	if getRR.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", getRR.Code)
+	}
+	var entry map[string]any
+	if err := json.Unmarshal(getRR.Body.Bytes(), &entry); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if entry["site_id"] != "local" {
+		t.Errorf("site_id = %v, want local", entry["site_id"])
+	}
+	if entry["method"] != http.MethodPost {
+		t.Errorf("method = %v, want POST", entry["method"])
+	}
+	if entry["status"] == nil {
+		t.Error("status field should be present")
+	}
+}
+
+func TestGetAudit_NotFound(t *testing.T) {
+	t.Chdir(t.TempDir())
+	rr := do(t, newRouter(t), http.MethodGet, "/sites/local/audit/9999999.json", nil)
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", rr.Code)
+	}
+}
+
+func TestGetAudit_InvalidFilename(t *testing.T) {
+	rr := do(t, newRouter(t), http.MethodGet, "/sites/local/audit/..%2Fetc%2Fpasswd", nil)
+	if rr.Code != http.StatusBadRequest && rr.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 400 or 404", rr.Code)
+	}
+}
+
+func TestAuditSiteIsolation(t *testing.T) {
+	t.Chdir(t.TempDir())
+	router := newRouter(t)
+
+	// Write event for "local" → generates audit entry for "local".
+	do(t, router, http.MethodPost, "/sites/local/events", []byte(`{"site":"local"}`))
+
+	// Audit entries for "staging" must be empty.
+	rr := do(t, router, http.MethodGet, "/sites/staging/audit", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	var body map[string]any
+	json.Unmarshal(rr.Body.Bytes(), &body) //nolint:errcheck
+	entries := body["entries"].([]any)
+	if len(entries) != 0 {
+		t.Errorf("staging should have 0 audit entries, got %d", len(entries))
+	}
+}
+
+// --- POST /sites/{site_id}/artifacts ---
+
+func TestPostArtifact_Valid(t *testing.T) {
+	t.Chdir(t.TempDir())
+	payload := []byte(`{"build":"1.0.0","hash":"abc123"}`)
+	rr := do(t, newRouter(t), http.MethodPost, "/sites/local/artifacts", payload)
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body: %s", rr.Code, rr.Body.String())
+	}
+	var body map[string]string
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body["site_id"] != "local" {
+		t.Errorf("site_id = %q, want local", body["site_id"])
+	}
+	if body["file"] == "" {
+		t.Error("file field should not be empty")
+	}
+}
+
+func TestPostArtifact_InvalidJSON(t *testing.T) {
+	rr := do(t, newRouter(t), http.MethodPost, "/sites/local/artifacts", []byte("not json"))
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rr.Code)
+	}
+}
+
+func TestPostArtifact_UnknownSite(t *testing.T) {
+	rr := do(t, newRouter(t), http.MethodPost, "/sites/unknown/artifacts", []byte(`{}`))
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", rr.Code)
+	}
+}
+
+// --- GET /sites/{site_id}/artifacts ---
+
+func TestListArtifacts_Empty(t *testing.T) {
+	t.Chdir(t.TempDir())
+	rr := do(t, newRouter(t), http.MethodGet, "/sites/local/artifacts", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	artifacts, ok := body["artifacts"].([]any)
+	if !ok {
+		t.Fatalf("artifacts field missing or wrong type: %v", body)
+	}
+	if len(artifacts) != 0 {
+		t.Errorf("expected 0 artifacts, got %d", len(artifacts))
+	}
+}
+
+func TestListArtifacts_AfterPost(t *testing.T) {
+	t.Chdir(t.TempDir())
+	router := newRouter(t)
+
+	do(t, router, http.MethodPost, "/sites/local/artifacts", []byte(`{"v":1}`))
+	do(t, router, http.MethodPost, "/sites/local/artifacts", []byte(`{"v":2}`))
+
+	rr := do(t, router, http.MethodGet, "/sites/local/artifacts", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	var body map[string]any
+	json.Unmarshal(rr.Body.Bytes(), &body) //nolint:errcheck
+	artifacts := body["artifacts"].([]any)
+	if len(artifacts) != 2 {
+		t.Errorf("expected 2 artifacts, got %d", len(artifacts))
+	}
+}
+
+// --- GET /sites/{site_id}/artifacts/{filename} ---
+
+func TestGetArtifact_Valid(t *testing.T) {
+	t.Chdir(t.TempDir())
+	router := newRouter(t)
+
+	payload := []byte(`{"artifact":"data"}`)
+	postRR := do(t, router, http.MethodPost, "/sites/local/artifacts", payload)
+	if postRR.Code != http.StatusCreated {
+		t.Fatalf("post failed: %d", postRR.Code)
+	}
+
+	var postBody map[string]string
+	json.Unmarshal(postRR.Body.Bytes(), &postBody) //nolint:errcheck
+	filename := postBody["file"]
+
+	getRR := do(t, router, http.MethodGet, "/sites/local/artifacts/"+filename, nil)
+	if getRR.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", getRR.Code)
+	}
+	if !bytes.Equal(getRR.Body.Bytes(), payload) {
+		t.Errorf("body = %s, want %s", getRR.Body.Bytes(), payload)
+	}
+}
+
+func TestGetArtifact_NotFound(t *testing.T) {
+	t.Chdir(t.TempDir())
+	rr := do(t, newRouter(t), http.MethodGet, "/sites/local/artifacts/9999999.json", nil)
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", rr.Code)
+	}
+}
+
+func TestGetArtifact_InvalidFilename(t *testing.T) {
+	rr := do(t, newRouter(t), http.MethodGet, "/sites/local/artifacts/..%2Fetc%2Fpasswd", nil)
+	if rr.Code != http.StatusBadRequest && rr.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 400 or 404", rr.Code)
+	}
+}
+
+// --- DELETE /sites/{site_id}/artifacts/{filename} ---
+
+func TestDeleteArtifact_Valid(t *testing.T) {
+	t.Chdir(t.TempDir())
+	router := newRouter(t)
+
+	postRR := do(t, router, http.MethodPost, "/sites/local/artifacts", []byte(`{"v":1}`))
+	if postRR.Code != http.StatusCreated {
+		t.Fatalf("post failed: %d", postRR.Code)
+	}
+	var postBody map[string]string
+	json.Unmarshal(postRR.Body.Bytes(), &postBody) //nolint:errcheck
+	filename := postBody["file"]
+
+	delRR := do(t, router, http.MethodDelete, "/sites/local/artifacts/"+filename, nil)
+	if delRR.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204; body: %s", delRR.Code, delRR.Body.String())
+	}
+
+	// Verify the file is gone.
+	getRR := do(t, router, http.MethodGet, "/sites/local/artifacts/"+filename, nil)
+	if getRR.Code != http.StatusNotFound {
+		t.Errorf("after delete: status = %d, want 404", getRR.Code)
+	}
+}
+
+func TestDeleteArtifact_NotFound(t *testing.T) {
+	t.Chdir(t.TempDir())
+	rr := do(t, newRouter(t), http.MethodDelete, "/sites/local/artifacts/9999999.json", nil)
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", rr.Code)
+	}
+}
+
+// --- GET /sites/{site_id}/config ---
+
+func TestGetConfig_NoFile(t *testing.T) {
+	t.Chdir(t.TempDir()) // no config files present
+	rr := do(t, newRouter(t), http.MethodGet, "/sites/local/config", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rr.Code, rr.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body["site_id"] != "local" {
+		t.Errorf("site_id = %v, want local", body["site_id"])
+	}
+	if body["settings"] == nil {
+		t.Error("settings field should be present")
+	}
+}
+
+func TestGetConfig_WithFile(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+
+	// Create contracts/sites/local/config.yaml inside the temp CWD.
+	configDir := filepath.Join(dir, "contracts", "sites", "local")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(configDir, "config.yaml"),
+		[]byte("site_id: local\nsettings:\n  env: test\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	rr := do(t, newRouter(t), http.MethodGet, "/sites/local/config", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	settings, ok := body["settings"].(map[string]any)
+	if !ok {
+		t.Fatalf("settings is not a map: %v", body)
+	}
+	if settings["env"] != "test" {
+		t.Errorf("settings.env = %v, want test", settings["env"])
+	}
+}
+
+// --- Observability ---
+
+func TestLivez(t *testing.T) {
+	rr := do(t, newRouter(t), http.MethodGet, "/healthz/live", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	var body map[string]string
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body["status"] != "ok" {
+		t.Errorf("status = %q, want ok", body["status"])
+	}
+}
+
+func TestReadyz(t *testing.T) {
+	rr := do(t, newRouter(t), http.MethodGet, "/healthz/ready", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body["status"] != "ok" {
+		t.Errorf("status = %v, want ok", body["status"])
+	}
+	if body["sites"] == nil {
+		t.Error("sites field should be present")
+	}
+}
+
+func TestMetrics(t *testing.T) {
+	rr := do(t, newRouter(t), http.MethodGet, "/metrics", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if _, ok := body["requests_total"]; !ok {
+		t.Error("requests_total counter should be present in /metrics")
+	}
+	if _, ok := body["requests_by_site"]; !ok {
+		t.Error("requests_by_site counter should be present in /metrics")
+	}
+}

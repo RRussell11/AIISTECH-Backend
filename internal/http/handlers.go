@@ -2,6 +2,7 @@ package http
 
 import (
 	"encoding/json"
+	"expvar"
 	"fmt"
 	"io"
 	"log/slog"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/RRussell11/AIISTECH-Backend/internal/config"
 	"github.com/RRussell11/AIISTECH-Backend/internal/site"
 	"github.com/RRussell11/AIISTECH-Backend/internal/state"
 )
@@ -188,4 +190,276 @@ func GetSiteHandler(w http.ResponseWriter, r *http.Request) {
 		"site_id":    sc.SiteID,
 		"state_root": state.StateRoot(sc.SiteID),
 	})
+}
+
+// --- Artifacts ---
+
+// PostArtifactHandler handles POST /sites/{site_id}/artifacts.
+// Stores a JSON payload as a nanosecond-timestamped file under ArtifactsDir.
+func PostArtifactHandler(w http.ResponseWriter, r *http.Request) {
+	sc, ok := site.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "site context missing", http.StatusInternalServerError)
+		return
+	}
+
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20)) // 1 MiB limit
+	if err != nil {
+		http.Error(w, "failed to read request body", http.StatusBadRequest)
+		return
+	}
+	defer r.Body.Close()
+
+	if !json.Valid(body) {
+		http.Error(w, "request body must be valid JSON", http.StatusBadRequest)
+		return
+	}
+
+	artifactsDir := state.ArtifactsDir(sc.SiteID)
+	if err := os.MkdirAll(artifactsDir, 0o755); err != nil {
+		slog.Error("failed to create artifacts dir", "site_id", sc.SiteID, "dir", artifactsDir, "error", err)
+		http.Error(w, "failed to create artifacts directory", http.StatusInternalServerError)
+		return
+	}
+
+	filename := fmt.Sprintf("%d.json", time.Now().UnixNano())
+	destPath := filepath.Join(artifactsDir, filename)
+	if err := os.WriteFile(destPath, body, 0o644); err != nil {
+		slog.Error("failed to write artifact file", "site_id", sc.SiteID, "path", destPath, "error", err)
+		http.Error(w, "failed to write artifact", http.StatusInternalServerError)
+		return
+	}
+
+	slog.Info("artifact written", "site_id", sc.SiteID, "path", destPath)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(map[string]string{ //nolint:errcheck
+		"status":  "created",
+		"site_id": sc.SiteID,
+		"file":    filename,
+	})
+}
+
+// ListArtifactsHandler handles GET /sites/{site_id}/artifacts.
+// Returns a JSON array of artifact filenames sorted ascending.
+func ListArtifactsHandler(w http.ResponseWriter, r *http.Request) {
+	sc, ok := site.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "site context missing", http.StatusInternalServerError)
+		return
+	}
+
+	artifactsDir := state.ArtifactsDir(sc.SiteID)
+	entries, err := os.ReadDir(artifactsDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
+				"site_id":   sc.SiteID,
+				"artifacts": []string{},
+			})
+			return
+		}
+		slog.Error("failed to read artifacts dir", "site_id", sc.SiteID, "dir", artifactsDir, "error", err)
+		http.Error(w, "failed to list artifacts", http.StatusInternalServerError)
+		return
+	}
+
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if !e.IsDir() {
+			names = append(names, e.Name())
+		}
+	}
+	sort.Strings(names)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
+		"site_id":   sc.SiteID,
+		"artifacts": names,
+	})
+}
+
+// GetArtifactHandler handles GET /sites/{site_id}/artifacts/{filename}.
+func GetArtifactHandler(w http.ResponseWriter, r *http.Request) {
+	sc, ok := site.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "site context missing", http.StatusInternalServerError)
+		return
+	}
+
+	filename := chi.URLParam(r, "filename")
+	if err := site.Validate(filename); err != nil {
+		http.Error(w, fmt.Sprintf("invalid filename: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	filePath := filepath.Join(state.ArtifactsDir(sc.SiteID), filename)
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			http.Error(w, "artifact not found", http.StatusNotFound)
+			return
+		}
+		slog.Error("failed to read artifact file", "site_id", sc.SiteID, "file", filename, "error", err)
+		http.Error(w, "failed to read artifact", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(data) //nolint:errcheck
+}
+
+// DeleteArtifactHandler handles DELETE /sites/{site_id}/artifacts/{filename}.
+func DeleteArtifactHandler(w http.ResponseWriter, r *http.Request) {
+	sc, ok := site.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "site context missing", http.StatusInternalServerError)
+		return
+	}
+
+	filename := chi.URLParam(r, "filename")
+	if err := site.Validate(filename); err != nil {
+		http.Error(w, fmt.Sprintf("invalid filename: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	filePath := filepath.Join(state.ArtifactsDir(sc.SiteID), filename)
+	if err := os.Remove(filePath); err != nil {
+		if os.IsNotExist(err) {
+			http.Error(w, "artifact not found", http.StatusNotFound)
+			return
+		}
+		slog.Error("failed to delete artifact", "site_id", sc.SiteID, "file", filename, "error", err)
+		http.Error(w, "failed to delete artifact", http.StatusInternalServerError)
+		return
+	}
+
+	slog.Info("artifact deleted", "site_id", sc.SiteID, "file", filename)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// --- Audit ---
+
+// ListAuditHandler handles GET /sites/{site_id}/audit.
+// Returns a JSON array of audit entry filenames sorted ascending.
+func ListAuditHandler(w http.ResponseWriter, r *http.Request) {
+	sc, ok := site.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "site context missing", http.StatusInternalServerError)
+		return
+	}
+
+	auditDir := state.AuditDir(sc.SiteID)
+	dirEntries, err := os.ReadDir(auditDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
+				"site_id": sc.SiteID,
+				"entries": []string{},
+			})
+			return
+		}
+		slog.Error("failed to read audit dir", "site_id", sc.SiteID, "dir", auditDir, "error", err)
+		http.Error(w, "failed to list audit entries", http.StatusInternalServerError)
+		return
+	}
+
+	names := make([]string, 0, len(dirEntries))
+	for _, e := range dirEntries {
+		if !e.IsDir() {
+			names = append(names, e.Name())
+		}
+	}
+	sort.Strings(names)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
+		"site_id": sc.SiteID,
+		"entries": names,
+	})
+}
+
+// GetAuditHandler handles GET /sites/{site_id}/audit/{filename}.
+// Returns the raw JSON content of the named audit entry file.
+func GetAuditHandler(w http.ResponseWriter, r *http.Request) {
+	sc, ok := site.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "site context missing", http.StatusInternalServerError)
+		return
+	}
+
+	filename := chi.URLParam(r, "filename")
+	if err := site.Validate(filename); err != nil {
+		http.Error(w, fmt.Sprintf("invalid filename: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	filePath := filepath.Join(state.AuditDir(sc.SiteID), filename)
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			http.Error(w, "audit entry not found", http.StatusNotFound)
+			return
+		}
+		slog.Error("failed to read audit file", "site_id", sc.SiteID, "file", filename, "error", err)
+		http.Error(w, "failed to read audit entry", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(data) //nolint:errcheck
+}
+
+// --- Config ---
+
+// GetConfigHandler handles GET /sites/{site_id}/config.
+// Returns the per-site configuration loaded from contracts/sites/<site_id>/config.yaml.
+// Returns an empty settings map if no config file exists for the site.
+func GetConfigHandler(w http.ResponseWriter, r *http.Request) {
+	sc, ok := site.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "site context missing", http.StatusInternalServerError)
+		return
+	}
+
+	cfg, err := config.Load(sc.SiteID, config.ConfigPath(sc.SiteID))
+	if err != nil {
+		slog.Error("failed to load site config", "site_id", sc.SiteID, "error", err)
+		http.Error(w, "failed to load site config", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(cfg) //nolint:errcheck
+}
+
+// --- Observability ---
+
+// LivezHandler handles GET /healthz/live.
+// Returns 200 OK as long as the process is running.
+func LivezHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"}) //nolint:errcheck
+}
+
+// ReadyzHandler handles GET /healthz/ready.
+// Returns 200 OK when the site registry is loaded and non-empty.
+func ReadyzHandler(reg *site.Registry) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ids := reg.SiteIDs()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
+			"status": "ok",
+			"sites":  len(ids),
+		})
+	}
+}
+
+// MetricsHandler handles GET /metrics.
+// Returns all registered expvar counters as JSON.
+func MetricsHandler(w http.ResponseWriter, r *http.Request) {
+	expvar.Handler().ServeHTTP(w, r)
 }

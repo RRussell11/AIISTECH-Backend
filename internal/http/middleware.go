@@ -1,13 +1,23 @@
 package http
 
 import (
+	"expvar"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/go-chi/chi/v5"
+	chimiddleware "github.com/go-chi/chi/v5/middleware"
 
+	auditpkg "github.com/RRussell11/AIISTECH-Backend/internal/audit"
 	"github.com/RRussell11/AIISTECH-Backend/internal/site"
+	"github.com/RRussell11/AIISTECH-Backend/internal/state"
+)
+
+var (
+	metricsReqsBySite = expvar.NewMap("requests_by_site")
+	metricsReqsTotal  = expvar.NewInt("requests_total")
 )
 
 // SiteMiddleware extracts {site_id} from the URL, resolves it against the
@@ -35,4 +45,61 @@ func SiteMiddleware(reg *site.Registry) func(http.Handler) http.Handler {
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
+}
+
+// statusRecorder wraps http.ResponseWriter to capture the HTTP status code written by a handler.
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func newStatusRecorder(w http.ResponseWriter) *statusRecorder {
+	return &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+}
+
+func (sr *statusRecorder) WriteHeader(code int) {
+	sr.status = code
+	sr.ResponseWriter.WriteHeader(code)
+}
+
+// AuditMiddleware automatically writes a structured audit entry for every
+// state-mutating (POST, PUT, PATCH, DELETE) site-scoped request.
+// It must be placed after SiteMiddleware so that the site context is available.
+func AuditMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost && r.Method != http.MethodPut &&
+			r.Method != http.MethodPatch && r.Method != http.MethodDelete {
+			next.ServeHTTP(w, r)
+			return
+		}
+		sr := newStatusRecorder(w)
+		next.ServeHTTP(sr, r)
+
+		sc, ok := site.FromContext(r.Context())
+		if !ok {
+			return
+		}
+		entry := auditpkg.Entry{
+			RequestID: chimiddleware.GetReqID(r.Context()),
+			SiteID:    sc.SiteID,
+			Method:    r.Method,
+			Path:      r.URL.Path,
+			Status:    sr.status,
+			Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
+		}
+		if err := auditpkg.Write(entry, state.AuditDir(sc.SiteID)); err != nil {
+			slog.Error("failed to write audit entry", "site_id", sc.SiteID, "error", err)
+		}
+	})
+}
+
+// MetricsMiddleware increments per-request expvar counters for every request.
+func MetricsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		next.ServeHTTP(w, r)
+		metricsReqsTotal.Add(1)
+		if sc, ok := site.FromContext(r.Context()); ok {
+			metricsReqsBySite.Add(sc.SiteID, 1)
+		}
+	})
 }
