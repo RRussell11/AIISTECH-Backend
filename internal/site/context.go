@@ -12,6 +12,9 @@ type contextKey struct{}
 type SiteContext struct {
 	SiteID string
 	Store  storage.Store
+	// APIKey is the bearer token required for mutating requests to this site.
+	// Empty means authentication is disabled for the site.
+	APIKey string
 }
 
 // NewContext returns a new context with sc attached.

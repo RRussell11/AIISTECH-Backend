@@ -14,6 +14,11 @@ const contractsBase = "contracts/sites"
 type SiteConfig struct {
 	SiteID   string            `yaml:"site_id"  json:"site_id"`
 	Settings map[string]string `yaml:"settings" json:"settings"`
+	// APIKey is the bearer token required for mutating requests to this site.
+	// When empty, authentication is disabled for the site.
+	// This field is intentionally excluded from JSON serialisation to prevent
+	// accidental key exposure via the /config endpoint.
+	APIKey string `yaml:"api_key" json:"-"`
 }
 
 // ConfigPath returns the conventional path for a site's config file, relative to CWD.

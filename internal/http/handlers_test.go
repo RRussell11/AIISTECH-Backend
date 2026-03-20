@@ -672,3 +672,113 @@ func TestMetrics(t *testing.T) {
 		t.Error("requests_by_site counter should be present in /metrics")
 	}
 }
+
+// --- Authentication ---
+
+// newRouterWithKey sets up a CWD that contains a config file for the "local"
+// site with the given API key, then returns a router anchored to that CWD.
+// Callers must have already called t.Chdir(t.TempDir()) or equivalent.
+func newRouterWithKey(t *testing.T, siteID, apiKey string) http.Handler {
+	t.Helper()
+	configDir := filepath.Join("contracts", "sites", siteID)
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	content := "site_id: " + siteID + "\napi_key: " + apiKey + "\nsettings:\n  env: test\n"
+	if err := os.WriteFile(filepath.Join(configDir, "config.yaml"), []byte(content), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	return newRouter(t)
+}
+
+func TestAuth_MutatingRequest_NoKey_SiteWithoutAuth(t *testing.T) {
+	// "local" has no api_key in temp CWD → auth disabled → POST must succeed
+	t.Chdir(t.TempDir())
+	rr := do(t, newRouter(t), http.MethodPost, "/sites/local/events", []byte(`{"x":1}`))
+	if rr.Code != http.StatusCreated {
+		t.Errorf("status = %d, want 201 (no auth configured)", rr.Code)
+	}
+}
+
+func TestAuth_MutatingRequest_MissingHeader_SiteWithAuth(t *testing.T) {
+	t.Chdir(t.TempDir())
+	router := newRouterWithKey(t, "local", "super-secret")
+	rr := do(t, router, http.MethodPost, "/sites/local/events", []byte(`{"x":1}`))
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401 when Authorization header is absent", rr.Code)
+	}
+}
+
+func TestAuth_MutatingRequest_WrongKey(t *testing.T) {
+	t.Chdir(t.TempDir())
+	router := newRouterWithKey(t, "local", "super-secret")
+
+	req, _ := http.NewRequest(http.MethodPost, "/sites/local/events", bytes.NewReader([]byte(`{"x":1}`)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer wrong-key")
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401 for wrong key", rr.Code)
+	}
+}
+
+func TestAuth_MutatingRequest_CorrectKey(t *testing.T) {
+	t.Chdir(t.TempDir())
+	router := newRouterWithKey(t, "local", "super-secret")
+
+	req, _ := http.NewRequest(http.MethodPost, "/sites/local/events", bytes.NewReader([]byte(`{"x":1}`)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer super-secret")
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+	if rr.Code != http.StatusCreated {
+		t.Errorf("status = %d, want 201 with correct Bearer key", rr.Code)
+	}
+}
+
+func TestAuth_ReadOnlyRequest_NoKey_SiteWithAuth(t *testing.T) {
+	// GET requests must not require auth even when the site has an api_key.
+	t.Chdir(t.TempDir())
+	router := newRouterWithKey(t, "local", "super-secret")
+	rr := do(t, router, http.MethodGet, "/sites/local/events", nil)
+	if rr.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200 (GET is open regardless of api_key)", rr.Code)
+	}
+}
+
+func TestAuth_WWWAuthenticateHeader(t *testing.T) {
+	t.Chdir(t.TempDir())
+	router := newRouterWithKey(t, "local", "super-secret")
+	rr := do(t, router, http.MethodPost, "/sites/local/events", []byte(`{"x":1}`))
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rr.Code)
+	}
+	if rr.Header().Get("WWW-Authenticate") == "" {
+		t.Error("WWW-Authenticate header should be present on 401 response")
+	}
+}
+
+func TestAuth_DeleteRequiresKey(t *testing.T) {
+	t.Chdir(t.TempDir())
+	router := newRouterWithKey(t, "local", "super-secret")
+
+	// First create an artifact with the correct key.
+	postReq, _ := http.NewRequest(http.MethodPost, "/sites/local/artifacts", bytes.NewReader([]byte(`{"v":1}`)))
+	postReq.Header.Set("Content-Type", "application/json")
+	postReq.Header.Set("Authorization", "Bearer super-secret")
+	postRR := httptest.NewRecorder()
+	router.ServeHTTP(postRR, postReq)
+	if postRR.Code != http.StatusCreated {
+		t.Fatalf("post status = %d, want 201", postRR.Code)
+	}
+	var postBody map[string]string
+	json.Unmarshal(postRR.Body.Bytes(), &postBody) //nolint:errcheck
+	filename := postBody["file"]
+
+	// Now DELETE without a key — must be rejected.
+	rr := do(t, router, http.MethodDelete, "/sites/local/artifacts/"+filename, nil)
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("DELETE without key: status = %d, want 401", rr.Code)
+	}
+}

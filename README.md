@@ -19,6 +19,7 @@ All stateful operations are scoped by an explicit `site_id`.
   - [Segment 5 — Configuration Contract Layer](#segment-5--configuration-contract-layer)
   - [Segment 6 — Observability & Operational Readiness](#segment-6--observability--operational-readiness)
   - [Segment 7 — Persistent Storage](#segment-7--persistent-storage)
+  - [Segment 8 — Authentication & Authorisation](#segment-8--authentication--authorisation)
 - [Roadmap](#roadmap)
 - [Tests](#tests)
 
@@ -333,12 +334,51 @@ No API changes — all existing endpoints behave identically; storage is now dur
 
 ---
 
+### Segment 8 — Authentication & Authorisation
+
+Each site optionally declares an `api_key` in its `contracts/sites/<site_id>/config.yaml`. When set, all state-mutating requests (POST, PUT, PATCH, DELETE) to that site's routes must carry:
+
+```
+Authorization: Bearer <api_key>
+```
+
+Read-only requests (GET, HEAD, OPTIONS) are always permitted regardless of configuration. Sites without an `api_key` remain fully open (useful for local development). The key is never exposed in the `GET /sites/{site_id}/config` JSON response.
+
+**Behaviour summary:**
+
+| Scenario | Result |
+|---|---|
+| Site has no `api_key` | All requests allowed |
+| Site has `api_key`, GET request | Allowed |
+| Site has `api_key`, mutating request, no `Authorization` header | `401 Unauthorized` |
+| Site has `api_key`, mutating request, wrong token | `401 Unauthorized` |
+| Site has `api_key`, mutating request, correct `Bearer <key>` | Allowed |
+
+`WWW-Authenticate: Bearer realm="aiistech"` is included on every `401` response.
+
+**Configuring a key:**
+
+```yaml
+# contracts/sites/staging/config.yaml
+site_id: staging
+api_key: your-secret-key-here
+settings:
+  env: staging
+```
+
+```bash
+# Calling a protected endpoint:
+curl -X POST http://localhost:8080/sites/staging/events \
+  -H "Authorization: Bearer your-secret-key-here" \
+  -H "Content-Type: application/json" \
+  -d '{"event":"deploy"}'
+```
+
+---
+
 ## Roadmap
 
 The following segments are planned but not yet implemented.
-
-### Segment 8 — Authentication & Authorisation
-Add per-site API-key middleware or HMAC request signing. Site keys would be defined in the per-site config contract and enforced before any state-mutating handler is reached.
 
 ### Segment 9 — Pagination
 Add `?limit=` and `?cursor=` (or `?page=`) query parameters to all list endpoints (`/events`, `/artifacts`, `/audit`) to avoid loading unbounded bucket scans into memory.

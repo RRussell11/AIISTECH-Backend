@@ -63,6 +63,40 @@ func TestLoad_DefaultsSiteIDWhenAbsentFromFile(t *testing.T) {
 	}
 }
 
+func TestLoad_APIKey(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "config.yaml")
+	content := "site_id: staging\napi_key: secret-key-abc\nsettings:\n  env: staging\n"
+	if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	cfg, err := config.Load("staging", p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.APIKey != "secret-key-abc" {
+		t.Errorf("APIKey = %q, want %q", cfg.APIKey, "secret-key-abc")
+	}
+}
+
+func TestLoad_NoAPIKey(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "config.yaml")
+	content := "site_id: local\nsettings:\n  env: development\n"
+	if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	cfg, err := config.Load("local", p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.APIKey != "" {
+		t.Errorf("APIKey = %q, want empty (no auth for local)", cfg.APIKey)
+	}
+}
+
 func TestLoad_NilSettingsNormalizedToEmptyMap(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "config.yaml")

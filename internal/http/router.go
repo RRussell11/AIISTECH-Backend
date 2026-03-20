@@ -27,6 +27,7 @@ func NewRouter(reg *site.Registry, stores *storage.Registry) http.Handler {
 	// Site-scoped routes
 	r.Route("/sites/{site_id}", func(r chi.Router) {
 		r.Use(SiteMiddleware(reg, stores))
+		r.Use(AuthMiddleware)  // enforces Bearer token for mutating requests when site has api_key
 		r.Use(AuditMiddleware) // auto-audit all mutating requests
 		r.Get("/", GetSiteHandler)
 		r.Get("/healthz", SiteHealthzHandler)
