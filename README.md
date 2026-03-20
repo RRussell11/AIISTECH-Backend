@@ -412,12 +412,46 @@ No breaking changes — existing callers that ignore `next_cursor` continue to w
 
 ---
 
+### Segment 10 — Docker & CI/CD
+
+A multi-stage `Dockerfile` and a GitHub Actions CI workflow are provided.
+
+#### Dockerfile
+
+The build uses two stages:
+
+| Stage | Image | Purpose |
+|---|---|---|
+| `builder` | `golang:1.24-alpine` | Compile a fully static binary (`CGO_ENABLED=0`) |
+| runtime | `gcr.io/distroless/static-debian12:nonroot` | Minimal, unprivileged final image |
+
+```bash
+# Build the image
+docker build -t aiistech-backend .
+
+# Run it (mounts contracts/ and var/ from the host)
+docker run -p 8080:8080 \
+  -v "$PWD/contracts:/contracts:ro" \
+  -v "$PWD/var:/var/state" \
+  -e AIISTECH_REGISTRY_PATH=/contracts/shared/sites.yaml \
+  aiistech-backend
+```
+
+#### CI workflow (`.github/workflows/ci.yml`)
+
+Triggers on every push and pull-request to any branch. Three sequential steps must all pass before the workflow is considered green:
+
+| Step | Command |
+|---|---|
+| Vet | `go vet ./...` |
+| Test | `go test ./...` |
+| Build | `go build ./cmd/server` |
+
+---
+
 ## Roadmap
 
-The following segments are planned but not yet implemented.
-
-### Segment 10 — Docker & CI/CD
-Add a multi-stage `Dockerfile` (distroless final layer) and a GitHub Actions workflow that gates every push with `go vet`, `go test ./...`, and `go build`.
+There are no further planned segments at this time.
 
 ---
 
