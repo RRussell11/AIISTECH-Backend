@@ -17,6 +17,12 @@ type Store interface {
 	// List returns all keys inside bucket in ascending order.
 	// Returns an empty slice when the bucket is absent.
 	List(bucket string) ([]string, error)
+	// ListPage returns up to limit keys from bucket whose byte-order position
+	// comes strictly after cursor (pass "" to start from the beginning).
+	// nextCursor is the last key returned, and can be passed as cursor in a
+	// subsequent call to fetch the next page. nextCursor is empty when there
+	// are no more keys after the returned page.
+	ListPage(bucket, cursor string, limit int) (keys []string, nextCursor string, err error)
 	// Delete removes the entry at bucket/key.
 	// Returns ErrNotFound when the bucket or key is absent.
 	Delete(bucket, key string) error

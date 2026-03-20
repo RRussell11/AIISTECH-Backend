@@ -782,3 +782,197 @@ func TestAuth_DeleteRequiresKey(t *testing.T) {
 		t.Errorf("DELETE without key: status = %d, want 401", rr.Code)
 	}
 }
+
+// --- Pagination ---
+
+// postN posts n events to /sites/local/events and returns the keys in insertion order.
+func postN(t *testing.T, router http.Handler, n int) []string {
+	t.Helper()
+	keys := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		rr := do(t, router, http.MethodPost, "/sites/local/events", []byte(`{"i":1}`))
+		if rr.Code != http.StatusCreated {
+			t.Fatalf("post %d: status=%d", i, rr.Code)
+		}
+		var body map[string]string
+		json.Unmarshal(rr.Body.Bytes(), &body) //nolint:errcheck
+		keys = append(keys, body["file"])
+	}
+	return keys
+}
+
+func listEventsPage(t *testing.T, router http.Handler, cursor, limit string) map[string]any {
+	t.Helper()
+	url := "/sites/local/events"
+	sep := "?"
+	if cursor != "" {
+		url += sep + "cursor=" + cursor
+		sep = "&"
+	}
+	if limit != "" {
+		url += sep + "limit=" + limit
+	}
+	rr := do(t, router, http.MethodGet, url, nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("GET %s: status=%d body=%s", url, rr.Code, rr.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	return body
+}
+
+func TestPagination_DefaultLimit_ReturnsAllWhenFewItems(t *testing.T) {
+	t.Chdir(t.TempDir())
+	router := newRouter(t)
+	postN(t, router, 3)
+
+	body := listEventsPage(t, router, "", "")
+	events := body["events"].([]any)
+	if len(events) != 3 {
+		t.Errorf("events len = %d, want 3", len(events))
+	}
+	if nc := body["next_cursor"].(string); nc != "" {
+		t.Errorf("next_cursor = %q, want empty (all items fit in one page)", nc)
+	}
+}
+
+func TestPagination_LimitParam_ConstrainsPageSize(t *testing.T) {
+	t.Chdir(t.TempDir())
+	router := newRouter(t)
+	postN(t, router, 5)
+
+	body := listEventsPage(t, router, "", "2")
+	events := body["events"].([]any)
+	if len(events) != 2 {
+		t.Errorf("page size = %d, want 2", len(events))
+	}
+	nc := body["next_cursor"].(string)
+	if nc == "" {
+		t.Errorf("next_cursor should be non-empty when more items exist")
+	}
+}
+
+func TestPagination_CursorAdvancesToNextPage(t *testing.T) {
+	t.Chdir(t.TempDir())
+	router := newRouter(t)
+	postN(t, router, 5)
+
+	// Page 1: limit=2
+	p1 := listEventsPage(t, router, "", "2")
+	p1Events := p1["events"].([]any)
+	if len(p1Events) != 2 {
+		t.Fatalf("page1 len = %d, want 2", len(p1Events))
+	}
+	cursor := p1["next_cursor"].(string)
+	if cursor == "" {
+		t.Fatal("page1 next_cursor is empty, expected a cursor for more pages")
+	}
+
+	// Page 2: limit=2 starting after cursor
+	p2 := listEventsPage(t, router, cursor, "2")
+	p2Events := p2["events"].([]any)
+	if len(p2Events) != 2 {
+		t.Fatalf("page2 len = %d, want 2", len(p2Events))
+	}
+	// No overlap between pages.
+	p1Set := make(map[any]bool)
+	for _, k := range p1Events {
+		p1Set[k] = true
+	}
+	for _, k := range p2Events {
+		if p1Set[k] {
+			t.Errorf("key %v appears on both page 1 and page 2", k)
+		}
+	}
+}
+
+func TestPagination_LastPageHasEmptyNextCursor(t *testing.T) {
+	t.Chdir(t.TempDir())
+	router := newRouter(t)
+	postN(t, router, 4)
+
+	// Page 1: limit=3
+	p1 := listEventsPage(t, router, "", "3")
+	cursor := p1["next_cursor"].(string)
+	if cursor == "" {
+		t.Fatal("page1 next_cursor is empty")
+	}
+
+	// Page 2 should return the remaining 1 item with an empty next_cursor.
+	p2 := listEventsPage(t, router, cursor, "3")
+	p2Events := p2["events"].([]any)
+	if len(p2Events) != 1 {
+		t.Errorf("page2 len = %d, want 1", len(p2Events))
+	}
+	if nc := p2["next_cursor"].(string); nc != "" {
+		t.Errorf("last page next_cursor = %q, want empty", nc)
+	}
+}
+
+func TestPagination_InvalidLimit_Returns400(t *testing.T) {
+	t.Chdir(t.TempDir())
+	router := newRouter(t)
+
+	for _, bad := range []string{"0", "-1", "abc", "1.5"} {
+		rr := do(t, router, http.MethodGet, "/sites/local/events?limit="+bad, nil)
+		if rr.Code != http.StatusBadRequest {
+			t.Errorf("limit=%q: status=%d, want 400", bad, rr.Code)
+		}
+	}
+}
+
+func TestPagination_MaxLimitClamped(t *testing.T) {
+	t.Chdir(t.TempDir())
+	router := newRouter(t)
+	postN(t, router, 3)
+
+	// limit=99999 should be clamped but not error; all 3 items returned.
+	body := listEventsPage(t, router, "", "99999")
+	events := body["events"].([]any)
+	if len(events) != 3 {
+		t.Errorf("events len = %d, want 3 (limit clamped to max)", len(events))
+	}
+}
+
+func TestPagination_ArtifactsAndAuditSupportCursor(t *testing.T) {
+	t.Chdir(t.TempDir())
+	router := newRouter(t)
+
+	// Create 3 artifacts.
+	for i := 0; i < 3; i++ {
+		do(t, router, http.MethodPost, "/sites/local/artifacts", []byte(`{"n":1}`))
+	}
+
+	// Artifacts: first page of 2.
+	rr := do(t, router, http.MethodGet, "/sites/local/artifacts?limit=2", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("artifacts list: status=%d", rr.Code)
+	}
+	var artBody map[string]any
+	json.Unmarshal(rr.Body.Bytes(), &artBody) //nolint:errcheck
+	if _, hasNC := artBody["next_cursor"]; !hasNC {
+		t.Error("artifacts response missing next_cursor field")
+	}
+	arts := artBody["artifacts"].([]any)
+	if len(arts) != 2 {
+		t.Errorf("artifacts page len = %d, want 2", len(arts))
+	}
+
+	// Audit: at least 3 entries written by the 3 POST requests above;
+	// fetch page of 2 and check for next_cursor.
+	rrA := do(t, router, http.MethodGet, "/sites/local/audit?limit=2", nil)
+	if rrA.Code != http.StatusOK {
+		t.Fatalf("audit list: status=%d", rrA.Code)
+	}
+	var auditBody map[string]any
+	json.Unmarshal(rrA.Body.Bytes(), &auditBody) //nolint:errcheck
+	if _, hasNC := auditBody["next_cursor"]; !hasNC {
+		t.Error("audit response missing next_cursor field")
+	}
+	entries := auditBody["entries"].([]any)
+	if len(entries) != 2 {
+		t.Errorf("audit page len = %d, want 2", len(entries))
+	}
+}

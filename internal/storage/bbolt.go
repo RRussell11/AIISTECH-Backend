@@ -106,6 +106,51 @@ func (s *BBoltStore) Close() error {
 	return s.db.Close()
 }
 
+// ListPage returns up to limit keys from bucket that come strictly after cursor
+// in ascending byte order. Pass cursor="" to start from the beginning.
+// nextCursor is the last key in the returned page; pass it as cursor on the
+// next call to fetch subsequent pages. nextCursor is "" when the end of the
+// bucket has been reached.
+func (s *BBoltStore) ListPage(bucket, cursor string, limit int) (keys []string, nextCursor string, err error) {
+	err = s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(bucket))
+		if b == nil {
+			return nil // bucket absent = empty page
+		}
+		c := b.Cursor()
+
+		var k []byte
+		if cursor == "" {
+			k, _ = c.First()
+		} else {
+			// Seek to the cursor key; if present, advance one position past it.
+			k, _ = c.Seek([]byte(cursor))
+			if k != nil && string(k) == cursor {
+				k, _ = c.Next()
+			}
+		}
+
+		for ; k != nil && len(keys) < limit; k, _ = c.Next() {
+			keys = append(keys, string(k))
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	if keys == nil {
+		keys = []string{}
+	}
+	if len(keys) > 0 {
+		nextCursor = keys[len(keys)-1]
+		// If we consumed fewer than limit items there are no more pages.
+		if len(keys) < limit {
+			nextCursor = ""
+		}
+	}
+	return keys, nextCursor, nil
+}
+
 // compile-time check that *BBoltStore satisfies Store.
 var _ Store = (*BBoltStore)(nil)
 

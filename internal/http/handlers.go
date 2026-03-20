@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -77,7 +78,9 @@ func PostEventHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // ListEventsHandler handles GET /sites/{site_id}/events.
-// Returns a JSON array of event keys sorted in ascending order.
+// Supports optional ?cursor= and ?limit= query parameters for cursor-based pagination.
+// Returns a JSON object with the event keys for the current page plus a next_cursor
+// value that can be used to fetch the next page (empty string when no more pages exist).
 func ListEventsHandler(w http.ResponseWriter, r *http.Request) {
 	sc, ok := site.FromContext(r.Context())
 	if !ok {
@@ -85,7 +88,12 @@ func ListEventsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	keys, err := sc.Store.List(bucketEvents)
+	cursor, limit, ok := parsePaginationParams(w, r)
+	if !ok {
+		return
+	}
+
+	keys, nextCursor, err := sc.Store.ListPage(bucketEvents, cursor, limit)
 	if err != nil {
 		slog.Error("failed to list events", "site_id", sc.SiteID, "error", err)
 		http.Error(w, "failed to list events", http.StatusInternalServerError)
@@ -94,8 +102,9 @@ func ListEventsHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
-		"site_id": sc.SiteID,
-		"events":  keys,
+		"site_id":     sc.SiteID,
+		"events":      keys,
+		"next_cursor": nextCursor,
 	})
 }
 
@@ -194,7 +203,9 @@ func PostArtifactHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // ListArtifactsHandler handles GET /sites/{site_id}/artifacts.
-// Returns a JSON array of artifact keys sorted ascending.
+// Supports optional ?cursor= and ?limit= query parameters for cursor-based pagination.
+// Returns a JSON object with the artifact keys for the current page plus a next_cursor
+// value that can be used to fetch the next page (empty string when no more pages exist).
 func ListArtifactsHandler(w http.ResponseWriter, r *http.Request) {
 	sc, ok := site.FromContext(r.Context())
 	if !ok {
@@ -202,7 +213,12 @@ func ListArtifactsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	keys, err := sc.Store.List(bucketArtifacts)
+	cursor, limit, ok := parsePaginationParams(w, r)
+	if !ok {
+		return
+	}
+
+	keys, nextCursor, err := sc.Store.ListPage(bucketArtifacts, cursor, limit)
 	if err != nil {
 		slog.Error("failed to list artifacts", "site_id", sc.SiteID, "error", err)
 		http.Error(w, "failed to list artifacts", http.StatusInternalServerError)
@@ -211,8 +227,9 @@ func ListArtifactsHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
-		"site_id":   sc.SiteID,
-		"artifacts": keys,
+		"site_id":     sc.SiteID,
+		"artifacts":   keys,
+		"next_cursor": nextCursor,
 	})
 }
 
@@ -276,7 +293,9 @@ func DeleteArtifactHandler(w http.ResponseWriter, r *http.Request) {
 // --- Audit ---
 
 // ListAuditHandler handles GET /sites/{site_id}/audit.
-// Returns a JSON array of audit entry keys sorted ascending.
+// Supports optional ?cursor= and ?limit= query parameters for cursor-based pagination.
+// Returns a JSON object with the audit entry keys for the current page plus a next_cursor
+// value that can be used to fetch the next page (empty string when no more pages exist).
 func ListAuditHandler(w http.ResponseWriter, r *http.Request) {
 	sc, ok := site.FromContext(r.Context())
 	if !ok {
@@ -284,7 +303,12 @@ func ListAuditHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	keys, err := sc.Store.List(bucketAudit)
+	cursor, limit, ok := parsePaginationParams(w, r)
+	if !ok {
+		return
+	}
+
+	keys, nextCursor, err := sc.Store.ListPage(bucketAudit, cursor, limit)
 	if err != nil {
 		slog.Error("failed to list audit entries", "site_id", sc.SiteID, "error", err)
 		http.Error(w, "failed to list audit entries", http.StatusInternalServerError)
@@ -293,8 +317,9 @@ func ListAuditHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
-		"site_id": sc.SiteID,
-		"entries": keys,
+		"site_id":     sc.SiteID,
+		"entries":     keys,
+		"next_cursor": nextCursor,
 	})
 }
 
@@ -393,5 +418,32 @@ func readJSONBody(r *http.Request) (body []byte, key string, err error) {
 		return nil, "", fmt.Errorf("request body must be valid JSON")
 	}
 	return raw, fmt.Sprintf("%d.json", time.Now().UnixNano()), nil
+}
+
+const (
+	defaultPageLimit = 50
+	maxPageLimit     = 200
+)
+
+// parsePaginationParams reads ?cursor= and ?limit= from r.
+// limit defaults to defaultPageLimit when absent; values above maxPageLimit are
+// clamped to maxPageLimit. An invalid (non-integer or negative) limit value
+// causes a 400 response and returns ok=false.
+func parsePaginationParams(w http.ResponseWriter, r *http.Request) (cursor string, limit int, ok bool) {
+	cursor = r.URL.Query().Get("cursor")
+	limit = defaultPageLimit
+
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 {
+			http.Error(w, "limit must be a positive integer", http.StatusBadRequest)
+			return "", 0, false
+		}
+		if n > maxPageLimit {
+			n = maxPageLimit
+		}
+		limit = n
+	}
+	return cursor, limit, true
 }
 

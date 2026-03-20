@@ -20,6 +20,7 @@ All stateful operations are scoped by an explicit `site_id`.
   - [Segment 6 — Observability & Operational Readiness](#segment-6--observability--operational-readiness)
   - [Segment 7 — Persistent Storage](#segment-7--persistent-storage)
   - [Segment 8 — Authentication & Authorisation](#segment-8--authentication--authorisation)
+  - [Segment 9 — Pagination](#segment-9--pagination)
 - [Roadmap](#roadmap)
 - [Tests](#tests)
 
@@ -376,12 +377,44 @@ curl -X POST http://localhost:8080/sites/staging/events \
 
 ---
 
+---
+
+### Segment 9 — Pagination
+
+All three list endpoints (`/events`, `/artifacts`, `/audit`) now support cursor-based pagination via `?limit=` and `?cursor=` query parameters.
+
+**Query parameters:**
+
+| Parameter | Default | Max | Description |
+|---|---|---|---|
+| `limit` | `50` | `200` | Maximum number of keys to return per page |
+| `cursor` | `""` | — | Opaque cursor returned by the previous page; omit to start from the beginning |
+
+**Response fields added:**
+
+| Field | Description |
+|---|---|
+| `next_cursor` | The cursor to pass on the next request to fetch the next page. Empty string when there are no more pages. |
+
+**Example — walking all events in pages of 10:**
+
+```bash
+# Page 1
+curl "http://localhost:8080/sites/local/events?limit=10"
+# → { "events": [...], "next_cursor": "1234567890.json", ... }
+
+# Page 2 (pass next_cursor from previous response)
+curl "http://localhost:8080/sites/local/events?limit=10&cursor=1234567890.json"
+# → { "events": [...], "next_cursor": "", ... }  ← empty cursor means last page
+```
+
+No breaking changes — existing callers that ignore `next_cursor` continue to work; the default limit of 50 is large enough to cover typical deployments without the need for pagination.
+
+---
+
 ## Roadmap
 
 The following segments are planned but not yet implemented.
-
-### Segment 9 — Pagination
-Add `?limit=` and `?cursor=` (or `?page=`) query parameters to all list endpoints (`/events`, `/artifacts`, `/audit`) to avoid loading unbounded bucket scans into memory.
 
 ### Segment 10 — Docker & CI/CD
 Add a multi-stage `Dockerfile` (distroless final layer) and a GitHub Actions workflow that gates every push with `go vet`, `go test ./...`, and `go build`.
