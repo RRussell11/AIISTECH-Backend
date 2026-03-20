@@ -11,6 +11,7 @@ import (
 
 	chihttp "github.com/RRussell11/AIISTECH-Backend/internal/http"
 	"github.com/RRussell11/AIISTECH-Backend/internal/site"
+	"github.com/RRussell11/AIISTECH-Backend/internal/storage"
 )
 
 // makeTestRegistry returns a Registry loaded from a temp file with local+staging.
@@ -36,7 +37,9 @@ sites:
 
 func newRouter(t *testing.T) http.Handler {
 	t.Helper()
-	return chihttp.NewRouter(makeTestRegistry(t))
+	stores := storage.NewRegistry()
+	t.Cleanup(func() { stores.CloseAll() })
+	return chihttp.NewRouter(makeTestRegistry(t), stores)
 }
 
 // do performs an HTTP request against the router and returns the response recorder.
@@ -153,7 +156,7 @@ func TestSiteHealthz_UnknownSite(t *testing.T) {
 // --- POST /sites/{site_id}/events ---
 
 func TestPostEvent_Valid(t *testing.T) {
-	// Redirect state writes to a temp dir so tests are hermetic.
+	// bbolt DB files are written to var/state/<site_id>/data.db relative to CWD.
 	t.Chdir(t.TempDir())
 
 	router := newRouter(t)
@@ -175,13 +178,13 @@ func TestPostEvent_Valid(t *testing.T) {
 		t.Fatal("file field should not be empty")
 	}
 
-	// Verify the file was written with the correct content.
-	written, err := os.ReadFile(filepath.Join("var", "state", "local", "events", filename))
-	if err != nil {
-		t.Fatalf("reading written file: %v", err)
+	// Verify the event can be retrieved via the API.
+	getRR := do(t, router, http.MethodGet, "/sites/local/events/"+filename, nil)
+	if getRR.Code != http.StatusOK {
+		t.Fatalf("GET event status = %d, want 200; body: %s", getRR.Code, getRR.Body.String())
 	}
-	if !bytes.Equal(written, payload) {
-		t.Errorf("file content = %s, want %s", written, payload)
+	if !bytes.Equal(getRR.Body.Bytes(), payload) {
+		t.Errorf("retrieved event = %s, want %s", getRR.Body.Bytes(), payload)
 	}
 }
 

@@ -23,3 +23,8 @@ func ArtifactsDir(siteID string) string {
 func AuditDir(siteID string) string {
 	return filepath.Join(StateRoot(siteID), "audit")
 }
+
+// DBPath returns the path to the bbolt database file for siteID.
+func DBPath(siteID string) string {
+	return filepath.Join(StateRoot(siteID), "data.db")
+}

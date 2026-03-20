@@ -13,6 +13,7 @@ import (
 
 	sitehttp "github.com/RRussell11/AIISTECH-Backend/internal/http"
 	"github.com/RRussell11/AIISTECH-Backend/internal/site"
+	"github.com/RRussell11/AIISTECH-Backend/internal/storage"
 )
 
 const defaultRegistryPath = "contracts/shared/sites.yaml"
@@ -44,12 +45,14 @@ func main() {
 	}
 	slog.Info("site registry loaded", "default_site_id", reg.DefaultSiteID, "sites", reg.SiteIDs())
 
+	stores := storage.NewRegistry()
+
 	addr := defaultAddr
 	if v := os.Getenv("AIISTECH_ADDR"); v != "" {
 		addr = v
 	}
 
-	router := sitehttp.NewRouter(reg)
+	router := sitehttp.NewRouter(reg, stores)
 
 	srv := &http.Server{
 		Addr:    addr,
@@ -77,5 +80,8 @@ func main() {
 		slog.Error("graceful shutdown failed", "error", err)
 		os.Exit(1)
 	}
+
+	stores.CloseAll()
 	slog.Info("server stopped")
 }
+

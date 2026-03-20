@@ -2,16 +2,32 @@ package audit_test
 
 import (
 	"encoding/json"
-	"os"
-	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/RRussell11/AIISTECH-Backend/internal/audit"
 )
 
-func TestWrite_CreatesFileWithCorrectContent(t *testing.T) {
-	dir := t.TempDir()
-	auditDir := filepath.Join(dir, "audit")
+// mockStorer captures Write calls in memory for use in tests.
+type mockStorer struct {
+	mu   sync.Mutex
+	keys []string
+	data map[string][]byte
+}
+
+func (m *mockStorer) Write(bucket, key string, value []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.data == nil {
+		m.data = make(map[string][]byte)
+	}
+	m.keys = append(m.keys, key)
+	m.data[key] = append([]byte(nil), value...) // defensive copy
+	return nil
+}
+
+func TestWrite_StoresEntryWithCorrectContent(t *testing.T) {
+	s := &mockStorer{}
 
 	entry := audit.Entry{
 		RequestID: "req-123",
@@ -22,25 +38,16 @@ func TestWrite_CreatesFileWithCorrectContent(t *testing.T) {
 		Timestamp: "2024-01-01T00:00:00Z",
 	}
 
-	if err := audit.Write(entry, auditDir); err != nil {
+	if err := audit.Write(entry, s); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
 
-	entries, err := os.ReadDir(auditDir)
-	if err != nil {
-		t.Fatalf("ReadDir: %v", err)
-	}
-	if len(entries) != 1 {
-		t.Fatalf("expected 1 audit file, got %d", len(entries))
-	}
-
-	data, err := os.ReadFile(filepath.Join(auditDir, entries[0].Name()))
-	if err != nil {
-		t.Fatalf("ReadFile: %v", err)
+	if len(s.keys) != 1 {
+		t.Fatalf("expected 1 write, got %d", len(s.keys))
 	}
 
 	var got audit.Entry
-	if err := json.Unmarshal(data, &got); err != nil {
+	if err := json.Unmarshal(s.data[s.keys[0]], &got); err != nil {
 		t.Fatalf("Unmarshal: %v", err)
 	}
 	if got.RequestID != entry.RequestID {
@@ -57,33 +64,38 @@ func TestWrite_CreatesFileWithCorrectContent(t *testing.T) {
 	}
 }
 
-func TestWrite_CreatesNestedDir(t *testing.T) {
-	dir := t.TempDir()
-	auditDir := filepath.Join(dir, "nested", "audit")
-
-	if err := audit.Write(audit.Entry{SiteID: "test"}, auditDir); err != nil {
-		t.Fatalf("Write with nested dir: %v", err)
+func TestWrite_KeyHasJsonSuffix(t *testing.T) {
+	s := &mockStorer{}
+	if err := audit.Write(audit.Entry{SiteID: "test"}, s); err != nil {
+		t.Fatalf("Write: %v", err)
 	}
-
-	if _, err := os.Stat(auditDir); err != nil {
-		t.Errorf("audit dir not created: %v", err)
+	if len(s.keys) == 0 {
+		t.Fatal("no write recorded")
+	}
+	key := s.keys[0]
+	if len(key) < 5 || key[len(key)-5:] != ".json" {
+		t.Errorf("key %q does not end in .json", key)
 	}
 }
 
-func TestWrite_MultipleEntriesDistinctFiles(t *testing.T) {
-	dir := t.TempDir()
+func TestWrite_MultipleEntriesDistinctKeys(t *testing.T) {
+	s := &mockStorer{}
 
 	for i := 0; i < 3; i++ {
-		if err := audit.Write(audit.Entry{SiteID: "local", Status: 200}, dir); err != nil {
+		if err := audit.Write(audit.Entry{SiteID: "local", Status: 200}, s); err != nil {
 			t.Fatalf("Write %d: %v", i, err)
 		}
 	}
 
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		t.Fatalf("ReadDir: %v", err)
+	seen := make(map[string]bool)
+	for _, k := range s.keys {
+		if seen[k] {
+			t.Errorf("duplicate key %q", k)
+		}
+		seen[k] = true
 	}
-	if len(entries) != 3 {
-		t.Errorf("expected 3 audit files, got %d", len(entries))
+	if len(s.keys) != 3 {
+		t.Errorf("expected 3 entries, got %d", len(s.keys))
 	}
 }
+

@@ -12,7 +12,7 @@ import (
 
 	auditpkg "github.com/RRussell11/AIISTECH-Backend/internal/audit"
 	"github.com/RRussell11/AIISTECH-Backend/internal/site"
-	"github.com/RRussell11/AIISTECH-Backend/internal/state"
+	"github.com/RRussell11/AIISTECH-Backend/internal/storage"
 )
 
 var (
@@ -21,9 +21,10 @@ var (
 )
 
 // SiteMiddleware extracts {site_id} from the URL, resolves it against the
-// registry, and attaches a SiteContext to the request context.
+// registry, opens the site's store from the StoreRegistry, and attaches a
+// SiteContext (including the Store) to the request context.
 // Requests with invalid or unknown site IDs are rejected with 400/404.
-func SiteMiddleware(reg *site.Registry) func(http.Handler) http.Handler {
+func SiteMiddleware(reg *site.Registry, stores *storage.Registry) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			rawID := chi.URLParam(r, "site_id")
@@ -39,7 +40,14 @@ func SiteMiddleware(reg *site.Registry) func(http.Handler) http.Handler {
 				return
 			}
 
-			sc := site.SiteContext{SiteID: siteID}
+			store, err := stores.Open(siteID)
+			if err != nil {
+				slog.Error("failed to open site store", "site_id", siteID, "error", err)
+				http.Error(w, "failed to open site store", http.StatusInternalServerError)
+				return
+			}
+
+			sc := site.SiteContext{SiteID: siteID, Store: store}
 			ctx := site.NewContext(r.Context(), sc)
 			slog.Info("request", "method", r.Method, "path", r.URL.Path, "site_id", siteID)
 			next.ServeHTTP(w, r.WithContext(ctx))
@@ -87,7 +95,7 @@ func AuditMiddleware(next http.Handler) http.Handler {
 			Status:    sr.status,
 			Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
 		}
-		if err := auditpkg.Write(entry, state.AuditDir(sc.SiteID)); err != nil {
+		if err := auditpkg.Write(entry, sc.Store); err != nil {
 			slog.Error("failed to write audit entry", "site_id", sc.SiteID, "error", err)
 		}
 	})

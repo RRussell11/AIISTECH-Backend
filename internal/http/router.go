@@ -7,10 +7,11 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 
 	"github.com/RRussell11/AIISTECH-Backend/internal/site"
+	"github.com/RRussell11/AIISTECH-Backend/internal/storage"
 )
 
 // NewRouter builds and returns the application HTTP router.
-func NewRouter(reg *site.Registry) http.Handler {
+func NewRouter(reg *site.Registry, stores *storage.Registry) http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.RequestID) // injects X-Request-Id for audit traceability
@@ -25,7 +26,7 @@ func NewRouter(reg *site.Registry) http.Handler {
 
 	// Site-scoped routes
 	r.Route("/sites/{site_id}", func(r chi.Router) {
-		r.Use(SiteMiddleware(reg))
+		r.Use(SiteMiddleware(reg, stores))
 		r.Use(AuditMiddleware) // auto-audit all mutating requests
 		r.Get("/", GetSiteHandler)
 		r.Get("/healthz", SiteHealthzHandler)
@@ -43,3 +44,4 @@ func NewRouter(reg *site.Registry) http.Handler {
 
 	return r
 }
+

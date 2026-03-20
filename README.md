@@ -18,6 +18,7 @@ All stateful operations are scoped by an explicit `site_id`.
   - [Segment 4 — Artifacts Vertical Slice](#segment-4--artifacts-vertical-slice)
   - [Segment 5 — Configuration Contract Layer](#segment-5--configuration-contract-layer)
   - [Segment 6 — Observability & Operational Readiness](#segment-6--observability--operational-readiness)
+  - [Segment 7 — Persistent Storage](#segment-7--persistent-storage)
 - [Roadmap](#roadmap)
 - [Tests](#tests)
 
@@ -67,7 +68,8 @@ internal/
   http/               # Router, middleware (Site, Audit, Metrics), handlers
   site/               # Registry loader, validator, resolver, context helpers
   state/              # Per-site filesystem path helpers
-var/state/            # Runtime state (gitignored); layout: var/state/<site_id>/...
+  storage/            # Store interface, BBoltStore, StoreRegistry
+var/state/            # Runtime state (gitignored); layout: var/state/<site_id>/data.db
 ```
 
 ## Site Registry
@@ -312,18 +314,34 @@ curl http://localhost:8080/metrics
 
 ---
 
+### Segment 7 — Persistent Storage
+
+> All site-scoped state (events, artifacts, audit) is persisted in a **bbolt** embedded key/value database at `var/state/<site_id>/data.db`. Each data category maps to a named bucket. Reads and writes are fully atomic, entries are sorted in ascending byte order with no extra sorting step, and concurrent access is safe.
+
+**Storage layout:**
+
+| Path | Contents |
+|---|---|
+| `var/state/<site_id>/data.db` | bbolt database for the site |
+| bucket `events` | keyed events (`<nanosecond>.json` → JSON payload) |
+| bucket `artifacts` | keyed artifacts (`<nanosecond>.json` → JSON payload) |
+| bucket `audit` | keyed audit entries (`<nanosecond>.json` → JSON payload) |
+
+The `StoreRegistry` opens each site's database lazily on first access and keeps it open for the lifetime of the server. All stores are closed gracefully on shutdown.
+
+No API changes — all existing endpoints behave identically; storage is now durable across restarts.
+
+---
+
 ## Roadmap
 
 The following segments are planned but not yet implemented.
-
-### Segment 7 — Persistent Storage
-Replace nanosecond-timestamped flat files with an embedded database (e.g. bbolt or SQLite) to provide atomic reads/writes, consistent list operations with structured metadata, and safe concurrent access.
 
 ### Segment 8 — Authentication & Authorisation
 Add per-site API-key middleware or HMAC request signing. Site keys would be defined in the per-site config contract and enforced before any state-mutating handler is reached.
 
 ### Segment 9 — Pagination
-Add `?limit=` and `?cursor=` (or `?page=`) query parameters to all list endpoints (`/events`, `/artifacts`, `/audit`) to avoid loading unbounded directory listings into memory.
+Add `?limit=` and `?cursor=` (or `?page=`) query parameters to all list endpoints (`/events`, `/artifacts`, `/audit`) to avoid loading unbounded bucket scans into memory.
 
 ### Segment 10 — Docker & CI/CD
 Add a multi-stage `Dockerfile` (distroless final layer) and a GitHub Actions workflow that gates every push with `go vet`, `go test ./...`, and `go build`.

@@ -1,12 +1,17 @@
 package site
 
-import "context"
+import (
+	"context"
+
+	"github.com/RRussell11/AIISTECH-Backend/internal/storage"
+)
 
 type contextKey struct{}
 
 // SiteContext holds the resolved site information attached to a request.
 type SiteContext struct {
 	SiteID string
+	Store  storage.Store
 }
 
 // NewContext returns a new context with sc attached.
@@ -20,3 +25,4 @@ func FromContext(ctx context.Context) (SiteContext, bool) {
 	sc, ok := ctx.Value(contextKey{}).(SiteContext)
 	return sc, ok
 }
+

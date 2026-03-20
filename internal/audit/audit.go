@@ -3,8 +3,6 @@ package audit
 import (
 	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
 	"time"
 )
 
@@ -18,20 +16,24 @@ type Entry struct {
 	Timestamp string `json:"timestamp"`
 }
 
-// Write serialises e to a nanosecond-timestamped JSON file under auditDir.
-// The directory is created if it does not already exist.
-func Write(e Entry, auditDir string) error {
-	if err := os.MkdirAll(auditDir, 0o755); err != nil {
-		return fmt.Errorf("creating audit dir: %w", err)
-	}
+// Storer is the write-side of any storage backend that can persist audit entries.
+// It is satisfied by *storage.BBoltStore (and any mock in tests).
+type Storer interface {
+	Write(bucket, key string, value []byte) error
+}
+
+// Write serialises e and persists it under the "audit" bucket with a
+// nanosecond-timestamped key. The caller is responsible for providing a Storer
+// that targets the correct per-site store.
+func Write(e Entry, s Storer) error {
 	data, err := json.Marshal(e)
 	if err != nil {
 		return fmt.Errorf("marshalling audit entry: %w", err)
 	}
-	filename := fmt.Sprintf("%d.json", time.Now().UnixNano())
-	dest := filepath.Join(auditDir, filename)
-	if err := os.WriteFile(dest, data, 0o644); err != nil {
-		return fmt.Errorf("writing audit file: %w", err)
+	key := fmt.Sprintf("%d.json", time.Now().UnixNano())
+	if err := s.Write("audit", key, data); err != nil {
+		return fmt.Errorf("writing audit entry: %w", err)
 	}
 	return nil
 }
+

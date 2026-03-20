@@ -2,14 +2,12 @@ package http
 
 import (
 	"encoding/json"
+	"errors"
 	"expvar"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
-	"os"
-	"path/filepath"
-	"sort"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -17,6 +15,13 @@ import (
 	"github.com/RRussell11/AIISTECH-Backend/internal/config"
 	"github.com/RRussell11/AIISTECH-Backend/internal/site"
 	"github.com/RRussell11/AIISTECH-Backend/internal/state"
+	"github.com/RRussell11/AIISTECH-Backend/internal/storage"
+)
+
+const (
+	bucketEvents    = "events"
+	bucketArtifacts = "artifacts"
+	bucketAudit     = "audit"
 )
 
 // HealthzHandler handles GET /healthz (non-site-scoped).
@@ -40,8 +45,7 @@ func SiteHealthzHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // PostEventHandler handles POST /sites/{site_id}/events.
-// It reads the request body and writes it as a JSON event file under
-// var/state/<site_id>/events/<timestamp>.json.
+// It reads the request body and persists it as a JSON event in the site store.
 func PostEventHandler(w http.ResponseWriter, r *http.Request) {
 	sc, ok := site.FromContext(r.Context())
 	if !ok {
@@ -49,47 +53,31 @@ func PostEventHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20)) // 1 MiB limit
+	body, key, err := readJSONBody(r)
 	if err != nil {
-		http.Error(w, "failed to read request body", http.StatusBadRequest)
-		return
-	}
-	defer r.Body.Close()
-
-	if !json.Valid(body) {
-		http.Error(w, "request body must be valid JSON", http.StatusBadRequest)
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	eventsDir := state.EventsDir(sc.SiteID)
-	if err := os.MkdirAll(eventsDir, 0o755); err != nil {
-		slog.Error("failed to create events dir", "site_id", sc.SiteID, "dir", eventsDir, "error", err)
-		http.Error(w, "failed to create events directory", http.StatusInternalServerError)
-		return
-	}
-
-	filename := fmt.Sprintf("%d.json", time.Now().UnixNano())
-	destPath := filepath.Join(eventsDir, filename)
-
-	if err := os.WriteFile(destPath, body, 0o644); err != nil {
-		slog.Error("failed to write event file", "site_id", sc.SiteID, "path", destPath, "error", err)
+	if err := sc.Store.Write(bucketEvents, key, body); err != nil {
+		slog.Error("failed to write event", "site_id", sc.SiteID, "key", key, "error", err)
 		http.Error(w, "failed to write event", http.StatusInternalServerError)
 		return
 	}
 
-	slog.Info("event written", "site_id", sc.SiteID, "path", destPath)
+	slog.Info("event written", "site_id", sc.SiteID, "key", key)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(map[string]string{ //nolint:errcheck
 		"status":  "created",
 		"site_id": sc.SiteID,
-		"file":    filename,
+		"file":    key,
 	})
 }
 
 // ListEventsHandler handles GET /sites/{site_id}/events.
-// Returns a JSON array of event filenames sorted in ascending order.
+// Returns a JSON array of event keys sorted in ascending order.
 func ListEventsHandler(w http.ResponseWriter, r *http.Request) {
 	sc, ok := site.FromContext(r.Context())
 	if !ok {
@@ -97,40 +85,22 @@ func ListEventsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	eventsDir := state.EventsDir(sc.SiteID)
-	entries, err := os.ReadDir(eventsDir)
+	keys, err := sc.Store.List(bucketEvents)
 	if err != nil {
-		if os.IsNotExist(err) {
-			// No events written yet — return empty list.
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
-				"site_id": sc.SiteID,
-				"events":  []string{},
-			})
-			return
-		}
-		slog.Error("failed to read events dir", "site_id", sc.SiteID, "dir", eventsDir, "error", err)
+		slog.Error("failed to list events", "site_id", sc.SiteID, "error", err)
 		http.Error(w, "failed to list events", http.StatusInternalServerError)
 		return
 	}
 
-	names := make([]string, 0, len(entries))
-	for _, e := range entries {
-		if !e.IsDir() {
-			names = append(names, e.Name())
-		}
-	}
-	sort.Strings(names)
-
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
 		"site_id": sc.SiteID,
-		"events":  names,
+		"events":  keys,
 	})
 }
 
 // GetEventHandler handles GET /sites/{site_id}/events/{filename}.
-// Returns the raw contents of the named event file.
+// Returns the raw contents of the named event.
 func GetEventHandler(w http.ResponseWriter, r *http.Request) {
 	sc, ok := site.FromContext(r.Context())
 	if !ok {
@@ -139,20 +109,18 @@ func GetEventHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	filename := chi.URLParam(r, "filename")
-	// Validate filename to prevent path traversal within the events dir.
 	if err := site.Validate(filename); err != nil {
 		http.Error(w, fmt.Sprintf("invalid filename: %v", err), http.StatusBadRequest)
 		return
 	}
 
-	filePath := filepath.Join(state.EventsDir(sc.SiteID), filename)
-	data, err := os.ReadFile(filePath)
+	data, err := sc.Store.Get(bucketEvents, filename)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, storage.ErrNotFound) {
 			http.Error(w, "event not found", http.StatusNotFound)
 			return
 		}
-		slog.Error("failed to read event file", "site_id", sc.SiteID, "file", filename, "error", err)
+		slog.Error("failed to read event", "site_id", sc.SiteID, "key", filename, "error", err)
 		http.Error(w, "failed to read event", http.StatusInternalServerError)
 		return
 	}
@@ -166,7 +134,6 @@ func GetEventHandler(w http.ResponseWriter, r *http.Request) {
 func ListSitesHandler(reg *site.Registry) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ids := reg.SiteIDs()
-		sort.Strings(ids)
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
@@ -195,7 +162,7 @@ func GetSiteHandler(w http.ResponseWriter, r *http.Request) {
 // --- Artifacts ---
 
 // PostArtifactHandler handles POST /sites/{site_id}/artifacts.
-// Stores a JSON payload as a nanosecond-timestamped file under ArtifactsDir.
+// Persists a JSON payload in the site store under the artifacts bucket.
 func PostArtifactHandler(w http.ResponseWriter, r *http.Request) {
 	sc, ok := site.FromContext(r.Context())
 	if !ok {
@@ -203,46 +170,31 @@ func PostArtifactHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20)) // 1 MiB limit
+	body, key, err := readJSONBody(r)
 	if err != nil {
-		http.Error(w, "failed to read request body", http.StatusBadRequest)
-		return
-	}
-	defer r.Body.Close()
-
-	if !json.Valid(body) {
-		http.Error(w, "request body must be valid JSON", http.StatusBadRequest)
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	artifactsDir := state.ArtifactsDir(sc.SiteID)
-	if err := os.MkdirAll(artifactsDir, 0o755); err != nil {
-		slog.Error("failed to create artifacts dir", "site_id", sc.SiteID, "dir", artifactsDir, "error", err)
-		http.Error(w, "failed to create artifacts directory", http.StatusInternalServerError)
-		return
-	}
-
-	filename := fmt.Sprintf("%d.json", time.Now().UnixNano())
-	destPath := filepath.Join(artifactsDir, filename)
-	if err := os.WriteFile(destPath, body, 0o644); err != nil {
-		slog.Error("failed to write artifact file", "site_id", sc.SiteID, "path", destPath, "error", err)
+	if err := sc.Store.Write(bucketArtifacts, key, body); err != nil {
+		slog.Error("failed to write artifact", "site_id", sc.SiteID, "key", key, "error", err)
 		http.Error(w, "failed to write artifact", http.StatusInternalServerError)
 		return
 	}
 
-	slog.Info("artifact written", "site_id", sc.SiteID, "path", destPath)
+	slog.Info("artifact written", "site_id", sc.SiteID, "key", key)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(map[string]string{ //nolint:errcheck
 		"status":  "created",
 		"site_id": sc.SiteID,
-		"file":    filename,
+		"file":    key,
 	})
 }
 
 // ListArtifactsHandler handles GET /sites/{site_id}/artifacts.
-// Returns a JSON array of artifact filenames sorted ascending.
+// Returns a JSON array of artifact keys sorted ascending.
 func ListArtifactsHandler(w http.ResponseWriter, r *http.Request) {
 	sc, ok := site.FromContext(r.Context())
 	if !ok {
@@ -250,34 +202,17 @@ func ListArtifactsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	artifactsDir := state.ArtifactsDir(sc.SiteID)
-	entries, err := os.ReadDir(artifactsDir)
+	keys, err := sc.Store.List(bucketArtifacts)
 	if err != nil {
-		if os.IsNotExist(err) {
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
-				"site_id":   sc.SiteID,
-				"artifacts": []string{},
-			})
-			return
-		}
-		slog.Error("failed to read artifacts dir", "site_id", sc.SiteID, "dir", artifactsDir, "error", err)
+		slog.Error("failed to list artifacts", "site_id", sc.SiteID, "error", err)
 		http.Error(w, "failed to list artifacts", http.StatusInternalServerError)
 		return
 	}
 
-	names := make([]string, 0, len(entries))
-	for _, e := range entries {
-		if !e.IsDir() {
-			names = append(names, e.Name())
-		}
-	}
-	sort.Strings(names)
-
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
 		"site_id":   sc.SiteID,
-		"artifacts": names,
+		"artifacts": keys,
 	})
 }
 
@@ -295,14 +230,13 @@ func GetArtifactHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	filePath := filepath.Join(state.ArtifactsDir(sc.SiteID), filename)
-	data, err := os.ReadFile(filePath)
+	data, err := sc.Store.Get(bucketArtifacts, filename)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, storage.ErrNotFound) {
 			http.Error(w, "artifact not found", http.StatusNotFound)
 			return
 		}
-		slog.Error("failed to read artifact file", "site_id", sc.SiteID, "file", filename, "error", err)
+		slog.Error("failed to read artifact", "site_id", sc.SiteID, "key", filename, "error", err)
 		http.Error(w, "failed to read artifact", http.StatusInternalServerError)
 		return
 	}
@@ -325,25 +259,24 @@ func DeleteArtifactHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	filePath := filepath.Join(state.ArtifactsDir(sc.SiteID), filename)
-	if err := os.Remove(filePath); err != nil {
-		if os.IsNotExist(err) {
+	if err := sc.Store.Delete(bucketArtifacts, filename); err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
 			http.Error(w, "artifact not found", http.StatusNotFound)
 			return
 		}
-		slog.Error("failed to delete artifact", "site_id", sc.SiteID, "file", filename, "error", err)
+		slog.Error("failed to delete artifact", "site_id", sc.SiteID, "key", filename, "error", err)
 		http.Error(w, "failed to delete artifact", http.StatusInternalServerError)
 		return
 	}
 
-	slog.Info("artifact deleted", "site_id", sc.SiteID, "file", filename)
+	slog.Info("artifact deleted", "site_id", sc.SiteID, "key", filename)
 	w.WriteHeader(http.StatusNoContent)
 }
 
 // --- Audit ---
 
 // ListAuditHandler handles GET /sites/{site_id}/audit.
-// Returns a JSON array of audit entry filenames sorted ascending.
+// Returns a JSON array of audit entry keys sorted ascending.
 func ListAuditHandler(w http.ResponseWriter, r *http.Request) {
 	sc, ok := site.FromContext(r.Context())
 	if !ok {
@@ -351,39 +284,22 @@ func ListAuditHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	auditDir := state.AuditDir(sc.SiteID)
-	dirEntries, err := os.ReadDir(auditDir)
+	keys, err := sc.Store.List(bucketAudit)
 	if err != nil {
-		if os.IsNotExist(err) {
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
-				"site_id": sc.SiteID,
-				"entries": []string{},
-			})
-			return
-		}
-		slog.Error("failed to read audit dir", "site_id", sc.SiteID, "dir", auditDir, "error", err)
+		slog.Error("failed to list audit entries", "site_id", sc.SiteID, "error", err)
 		http.Error(w, "failed to list audit entries", http.StatusInternalServerError)
 		return
 	}
 
-	names := make([]string, 0, len(dirEntries))
-	for _, e := range dirEntries {
-		if !e.IsDir() {
-			names = append(names, e.Name())
-		}
-	}
-	sort.Strings(names)
-
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
 		"site_id": sc.SiteID,
-		"entries": names,
+		"entries": keys,
 	})
 }
 
 // GetAuditHandler handles GET /sites/{site_id}/audit/{filename}.
-// Returns the raw JSON content of the named audit entry file.
+// Returns the raw JSON content of the named audit entry.
 func GetAuditHandler(w http.ResponseWriter, r *http.Request) {
 	sc, ok := site.FromContext(r.Context())
 	if !ok {
@@ -397,14 +313,13 @@ func GetAuditHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	filePath := filepath.Join(state.AuditDir(sc.SiteID), filename)
-	data, err := os.ReadFile(filePath)
+	data, err := sc.Store.Get(bucketAudit, filename)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, storage.ErrNotFound) {
 			http.Error(w, "audit entry not found", http.StatusNotFound)
 			return
 		}
-		slog.Error("failed to read audit file", "site_id", sc.SiteID, "file", filename, "error", err)
+		slog.Error("failed to read audit entry", "site_id", sc.SiteID, "key", filename, "error", err)
 		http.Error(w, "failed to read audit entry", http.StatusInternalServerError)
 		return
 	}
@@ -463,3 +378,20 @@ func ReadyzHandler(reg *site.Registry) http.HandlerFunc {
 func MetricsHandler(w http.ResponseWriter, r *http.Request) {
 	expvar.Handler().ServeHTTP(w, r)
 }
+
+// --- helpers ---
+
+// readJSONBody reads and validates a JSON request body (max 1 MiB).
+// It returns the raw bytes and a nanosecond-timestamped storage key.
+func readJSONBody(r *http.Request) (body []byte, key string, err error) {
+	raw, readErr := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	defer r.Body.Close()
+	if readErr != nil {
+		return nil, "", fmt.Errorf("failed to read request body")
+	}
+	if !json.Valid(raw) {
+		return nil, "", fmt.Errorf("request body must be valid JSON")
+	}
+	return raw, fmt.Sprintf("%d.json", time.Now().UnixNano()), nil
+}
+
