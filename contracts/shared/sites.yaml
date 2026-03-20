@@ -1,0 +1,5 @@
+default_site_id: "local"
+sites:
+  - site_id: "local"
+  - site_id: "staging"
+  - site_id: "prod"

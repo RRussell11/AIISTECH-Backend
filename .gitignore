@@ -1,0 +1,7 @@
+# Runtime state
+var/state/
+
+# Go build output
+*.exe
+*.test
+*.out
