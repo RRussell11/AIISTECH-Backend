@@ -3,6 +3,26 @@
 A Go HTTP backend implementing the **Site as Tenant / Governance Namespace** pattern.  
 All stateful operations are scoped by an explicit `site_id`.
 
+## Table of Contents
+
+- [Requirements](#requirements)
+- [Quick Start](#quick-start)
+- [Environment Variables](#environment-variables)
+- [Project Structure](#project-structure)
+- [Site Registry](#site-registry)
+- [Per-Site Configuration](#per-site-configuration)
+- [API Reference](#api-reference)
+  - [Segment 1 — Core Site Scaffolding](#segment-1--core-site-scaffolding)
+  - [Segment 2 — Events Vertical Slice](#segment-2--events-vertical-slice)
+  - [Segment 3 — Structured Audit Trail](#segment-3--structured-audit-trail)
+  - [Segment 4 — Artifacts Vertical Slice](#segment-4--artifacts-vertical-slice)
+  - [Segment 5 — Configuration Contract Layer](#segment-5--configuration-contract-layer)
+  - [Segment 6 — Observability & Operational Readiness](#segment-6--observability--operational-readiness)
+- [Roadmap](#roadmap)
+- [Tests](#tests)
+
+---
+
 ## Requirements
 
 - Go 1.24+
@@ -21,77 +41,34 @@ go mod download
 go run ./cmd/server
 ```
 
-The server reads the site registry from `contracts/shared/sites.yaml` on startup.
+The server reads the site registry from `contracts/shared/sites.yaml` on startup and shuts down gracefully on `SIGINT`/`SIGTERM` with a 10-second drain window.
 
-### Environment variables
+## Environment Variables
 
 | Variable | Default | Description |
 |---|---|---|
 | `AIISTECH_ADDR` | `:8080` | Listen address |
 | `AIISTECH_REGISTRY_PATH` | `contracts/shared/sites.yaml` | Path to site registry file |
-| `AIISTECH_SITE_ID` | _(registry default)_ | Override site selection for non-scoped operations |
+| `AIISTECH_LOG_LEVEL` | `INFO` | Structured log verbosity (`DEBUG`, `INFO`, `WARN`, `ERROR`) |
 
-## API
-
-### `GET /healthz`
-Non-site-scoped health check.
+## Project Structure
 
 ```
-curl http://localhost:8080/healthz
-# {"status":"ok"}
+cmd/server/           # Server entrypoint (startup, shutdown, env config)
+contracts/
+  shared/             # Shared site registry (sites.yaml)
+  sites/
+    local/            # Per-site config contracts
+    staging/
+    prod/
+internal/
+  audit/              # Audit entry struct + Write helper
+  config/             # Per-site config loader (SiteConfig, ConfigPath, Load)
+  http/               # Router, middleware (Site, Audit, Metrics), handlers
+  site/               # Registry loader, validator, resolver, context helpers
+  state/              # Per-site filesystem path helpers
+var/state/            # Runtime state (gitignored); layout: var/state/<site_id>/...
 ```
-
-### `GET /sites`
-List all registered sites and the default site.
-
-```
-curl http://localhost:8080/sites
-# {"default_site_id":"local","sites":["local","prod","staging"]}
-```
-
-### `GET /sites/{site_id}`
-Get site metadata including its state root path.
-
-```
-curl http://localhost:8080/sites/local/
-# {"site_id":"local","state_root":"var/state/local"}
-```
-
-### `GET /sites/{site_id}/healthz`
-Site-scoped health check.
-
-```
-curl http://localhost:8080/sites/local/healthz
-# {"site_id":"local","status":"ok"}
-```
-
-### `POST /sites/{site_id}/events`
-Write a JSON event to `var/state/<site_id>/events/<timestamp>.json`.
-
-```
-curl -X POST http://localhost:8080/sites/local/events \
-  -H 'Content-Type: application/json' \
-  -d '{"event":"deploy","version":"1.0.0"}'
-# {"file":"...json","site_id":"local","status":"created"}
-```
-
-### `GET /sites/{site_id}/events`
-List all event filenames for a site (sorted ascending).
-
-```
-curl http://localhost:8080/sites/local/events
-# {"events":["1234.json"],"site_id":"local"}
-```
-
-### `GET /sites/{site_id}/events/{filename}`
-Fetch the contents of a specific event file.
-
-```
-curl http://localhost:8080/sites/local/events/1234.json
-# {"event":"deploy","version":"1.0.0"}
-```
-
-Unknown or invalid `site_id` values return a `404` with a clear error message.
 
 ## Site Registry
 
@@ -105,19 +82,253 @@ sites:
   - site_id: "prod"
 ```
 
-Site IDs must be non-empty and must not contain `..`, `/`, or `\`.
+Rules:
+- `default_site_id` is required and must appear in the `sites` list.
+- Site IDs must be non-empty and must not contain `..`, `/`, or `\`.
+- Unknown or invalid `site_id` values in API requests return `404`.
 
-## Project Structure
+## Per-Site Configuration
+
+Each site may have a config file at `contracts/sites/<site_id>/config.yaml`:
+
+```yaml
+site_id: local
+settings:
+  env: development
+  log_level: debug
+```
+
+The `settings` map accepts arbitrary key/value string pairs. If the file does not exist for a site, an empty settings map is returned without error.
+
+---
+
+## API Reference
+
+All site-scoped routes follow the pattern `/sites/{site_id}/...`.  
+Mutating requests (`POST`, `PUT`, `PATCH`, `DELETE`) are automatically recorded to the site's audit trail.  
+All responses are `application/json`.
+
+---
+
+### Segment 1 — Core Site Scaffolding
+
+> Site-as-tenant foundation: registry loading, site validation, and metadata endpoints.
+
+#### `GET /sites`
+List all registered sites and the current default.
 
 ```
-cmd/server/         # Server entrypoint
-contracts/shared/   # Contract-owned site registry (sites.yaml)
-internal/
-  http/             # Router, middleware, handlers (+ integration tests)
-  site/             # Registry loader, validator, resolver, context helpers
-  state/            # Per-site state path helpers (events, artifacts, audit)
-var/state/          # Runtime state (gitignored); layout: var/state/<site_id>/...
+curl http://localhost:8080/sites
+# {"default_site_id":"local","sites":["local","prod","staging"]}
 ```
+
+#### `GET /sites/{site_id}`
+Get site metadata including its state root path.
+
+```
+curl http://localhost:8080/sites/local
+# {"site_id":"local","state_root":"var/state/local"}
+```
+
+---
+
+### Segment 2 — Events Vertical Slice
+
+> Append-only event log per site. Events are stored as nanosecond-timestamped JSON files under `var/state/<site_id>/events/`.
+
+#### `POST /sites/{site_id}/events`
+Write a JSON event. Body must be valid JSON (max 1 MiB). Returns the generated filename.
+
+```
+curl -X POST http://localhost:8080/sites/local/events \
+  -H 'Content-Type: application/json' \
+  -d '{"event":"deploy","version":"1.0.0"}'
+# {"file":"1234567890.json","site_id":"local","status":"created"}
+```
+
+Response: `201 Created`
+
+#### `GET /sites/{site_id}/events`
+List all event filenames, sorted ascending. Returns an empty array if no events exist.
+
+```
+curl http://localhost:8080/sites/local/events
+# {"events":["1234567890.json"],"site_id":"local"}
+```
+
+#### `GET /sites/{site_id}/events/{filename}`
+Fetch the contents of a specific event file.
+
+```
+curl http://localhost:8080/sites/local/events/1234567890.json
+# {"event":"deploy","version":"1.0.0"}
+```
+
+Returns `404` if the file does not exist. Returns `400` if the filename contains path traversal characters.
+
+---
+
+### Segment 3 — Structured Audit Trail
+
+> Every mutating (`POST`, `PUT`, `PATCH`, `DELETE`) request on a site-scoped route is automatically recorded as a structured audit entry in `var/state/<site_id>/audit/`.
+
+Audit entries are written by `AuditMiddleware` after the handler responds and require no opt-in from callers.
+
+**Audit entry schema:**
+
+```json
+{
+  "request_id": "abc123",
+  "site_id": "local",
+  "method": "POST",
+  "path": "/sites/local/events",
+  "status": 201,
+  "timestamp": "2026-01-01T00:00:00.000000000Z"
+}
+```
+
+#### `GET /sites/{site_id}/audit`
+List all audit entry filenames for a site, sorted ascending.
+
+```
+curl http://localhost:8080/sites/local/audit
+# {"entries":["1234567890.json"],"site_id":"local"}
+```
+
+#### `GET /sites/{site_id}/audit/{filename}`
+Fetch a specific audit entry.
+
+```
+curl http://localhost:8080/sites/local/audit/1234567890.json
+# {"request_id":"...","site_id":"local","method":"POST","path":"...","status":201,"timestamp":"..."}
+```
+
+---
+
+### Segment 4 — Artifacts Vertical Slice
+
+> Binary/JSON artifact storage per site. Artifacts are stored in `var/state/<site_id>/artifacts/`. Supports create, list, fetch, and delete.
+
+#### `POST /sites/{site_id}/artifacts`
+Store a JSON payload as an artifact. Body must be valid JSON (max 1 MiB).
+
+```
+curl -X POST http://localhost:8080/sites/local/artifacts \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"build-output","sha":"abc123"}'
+# {"file":"1234567890.json","site_id":"local","status":"created"}
+```
+
+Response: `201 Created`
+
+#### `GET /sites/{site_id}/artifacts`
+List all artifact filenames, sorted ascending.
+
+```
+curl http://localhost:8080/sites/local/artifacts
+# {"artifacts":["1234567890.json"],"site_id":"local"}
+```
+
+#### `GET /sites/{site_id}/artifacts/{filename}`
+Fetch a specific artifact.
+
+```
+curl http://localhost:8080/sites/local/artifacts/1234567890.json
+# {"name":"build-output","sha":"abc123"}
+```
+
+#### `DELETE /sites/{site_id}/artifacts/{filename}`
+Delete an artifact. Returns `204 No Content` on success, `404` if not found.
+
+```
+curl -X DELETE http://localhost:8080/sites/local/artifacts/1234567890.json
+# HTTP 204
+```
+
+---
+
+### Segment 5 — Configuration Contract Layer
+
+> Read-only access to per-site configuration loaded from `contracts/sites/<site_id>/config.yaml`.
+
+#### `GET /sites/{site_id}/config`
+Return the parsed configuration for a site. Returns an empty `settings` map if no config file exists.
+
+```
+curl http://localhost:8080/sites/local/config
+# {"site_id":"local","settings":{"env":"development","log_level":"debug"}}
+```
+
+---
+
+### Segment 6 — Observability & Operational Readiness
+
+> Process health probes and expvar-based request metrics.
+
+#### `GET /healthz`
+Backward-compatible liveness check (non-site-scoped).
+
+```
+curl http://localhost:8080/healthz
+# {"status":"ok"}
+```
+
+#### `GET /healthz/live`
+Explicit liveness probe. Returns `200 OK` as long as the process is running.
+
+```
+curl http://localhost:8080/healthz/live
+# {"status":"ok"}
+```
+
+#### `GET /healthz/ready`
+Readiness probe. Returns `200 OK` when the site registry is loaded and contains at least one site.
+
+```
+curl http://localhost:8080/healthz/ready
+# {"sites":3,"status":"ok"}
+```
+
+#### `GET /sites/{site_id}/healthz`
+Site-scoped health check. Returns `404` for unknown site IDs.
+
+```
+curl http://localhost:8080/sites/local/healthz
+# {"site_id":"local","status":"ok"}
+```
+
+#### `GET /metrics`
+Expvar-based request metrics (JSON). Key counters:
+
+| Key | Type | Description |
+|---|---|---|
+| `requests_total` | int | Total requests handled |
+| `requests_by_site` | map | Request count broken down by `site_id` |
+
+```
+curl http://localhost:8080/metrics
+# {"requests_total":42,"requests_by_site":{"local":35,"staging":7},...}
+```
+
+---
+
+## Roadmap
+
+The following segments are planned but not yet implemented.
+
+### Segment 7 — Persistent Storage
+Replace nanosecond-timestamped flat files with an embedded database (e.g. bbolt or SQLite) to provide atomic reads/writes, consistent list operations with structured metadata, and safe concurrent access.
+
+### Segment 8 — Authentication & Authorisation
+Add per-site API-key middleware or HMAC request signing. Site keys would be defined in the per-site config contract and enforced before any state-mutating handler is reached.
+
+### Segment 9 — Pagination
+Add `?limit=` and `?cursor=` (or `?page=`) query parameters to all list endpoints (`/events`, `/artifacts`, `/audit`) to avoid loading unbounded directory listings into memory.
+
+### Segment 10 — Docker & CI/CD
+Add a multi-stage `Dockerfile` (distroless final layer) and a GitHub Actions workflow that gates every push with `go vet`, `go test ./...`, and `go build`.
+
+---
 
 ## Tests
 
