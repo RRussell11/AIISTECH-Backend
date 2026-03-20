@@ -41,6 +41,22 @@ curl http://localhost:8080/healthz
 # {"status":"ok"}
 ```
 
+### `GET /sites`
+List all registered sites and the default site.
+
+```
+curl http://localhost:8080/sites
+# {"default_site_id":"local","sites":["local","prod","staging"]}
+```
+
+### `GET /sites/{site_id}`
+Get site metadata including its state root path.
+
+```
+curl http://localhost:8080/sites/local/
+# {"site_id":"local","state_root":"var/state/local"}
+```
+
 ### `GET /sites/{site_id}/healthz`
 Site-scoped health check.
 
@@ -57,6 +73,22 @@ curl -X POST http://localhost:8080/sites/local/events \
   -H 'Content-Type: application/json' \
   -d '{"event":"deploy","version":"1.0.0"}'
 # {"file":"...json","site_id":"local","status":"created"}
+```
+
+### `GET /sites/{site_id}/events`
+List all event filenames for a site (sorted ascending).
+
+```
+curl http://localhost:8080/sites/local/events
+# {"events":["1234.json"],"site_id":"local"}
+```
+
+### `GET /sites/{site_id}/events/{filename}`
+Fetch the contents of a specific event file.
+
+```
+curl http://localhost:8080/sites/local/events/1234.json
+# {"event":"deploy","version":"1.0.0"}
 ```
 
 Unknown or invalid `site_id` values return a `404` with a clear error message.
@@ -81,9 +113,9 @@ Site IDs must be non-empty and must not contain `..`, `/`, or `\`.
 cmd/server/         # Server entrypoint
 contracts/shared/   # Contract-owned site registry (sites.yaml)
 internal/
-  http/             # Router, middleware, handlers
+  http/             # Router, middleware, handlers (+ integration tests)
   site/             # Registry loader, validator, resolver, context helpers
-  state/            # Per-site state path helpers
+  state/            # Per-site state path helpers (events, artifacts, audit)
 var/state/          # Runtime state (gitignored); layout: var/state/<site_id>/...
 ```
 

@@ -13,3 +13,13 @@ func StateRoot(siteID string) string {
 func EventsDir(siteID string) string {
 	return filepath.Join(StateRoot(siteID), "events")
 }
+
+// ArtifactsDir returns the directory for artifact files belonging to siteID.
+func ArtifactsDir(siteID string) string {
+	return filepath.Join(StateRoot(siteID), "artifacts")
+}
+
+// AuditDir returns the directory for audit log entries belonging to siteID.
+func AuditDir(siteID string) string {
+	return filepath.Join(StateRoot(siteID), "audit")
+}
