@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -79,6 +80,7 @@ func PostEventHandler(w http.ResponseWriter, r *http.Request) {
 
 // ListEventsHandler handles GET /sites/{site_id}/events.
 // Supports optional ?cursor= and ?limit= query parameters for cursor-based pagination.
+// Segment 11: also supports filtering via since_ns/until_ns/prefix/contains.
 // Returns a JSON object with the event keys for the current page plus a next_cursor
 // value that can be used to fetch the next page (empty string when no more pages exist).
 func ListEventsHandler(w http.ResponseWriter, r *http.Request) {
@@ -93,7 +95,12 @@ func ListEventsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	keys, nextCursor, err := sc.Store.ListPage(bucketEvents, cursor, limit)
+	filter, ok := parseFilterParams(w, r)
+	if !ok {
+		return
+	}
+
+	keys, nextCursor, err := listFilteredPage(sc.Store, bucketEvents, cursor, limit, filter)
 	if err != nil {
 		slog.Error("failed to list events", "site_id", sc.SiteID, "error", err)
 		http.Error(w, "failed to list events", http.StatusInternalServerError)
@@ -204,8 +211,7 @@ func PostArtifactHandler(w http.ResponseWriter, r *http.Request) {
 
 // ListArtifactsHandler handles GET /sites/{site_id}/artifacts.
 // Supports optional ?cursor= and ?limit= query parameters for cursor-based pagination.
-// Returns a JSON object with the artifact keys for the current page plus a next_cursor
-// value that can be used to fetch the next page (empty string when no more pages exist).
+// Segment 11: also supports filtering via since_ns/until_ns/prefix/contains.
 func ListArtifactsHandler(w http.ResponseWriter, r *http.Request) {
 	sc, ok := site.FromContext(r.Context())
 	if !ok {
@@ -218,7 +224,12 @@ func ListArtifactsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	keys, nextCursor, err := sc.Store.ListPage(bucketArtifacts, cursor, limit)
+	filter, ok := parseFilterParams(w, r)
+	if !ok {
+		return
+	}
+
+	keys, nextCursor, err := listFilteredPage(sc.Store, bucketArtifacts, cursor, limit, filter)
 	if err != nil {
 		slog.Error("failed to list artifacts", "site_id", sc.SiteID, "error", err)
 		http.Error(w, "failed to list artifacts", http.StatusInternalServerError)
@@ -294,8 +305,7 @@ func DeleteArtifactHandler(w http.ResponseWriter, r *http.Request) {
 
 // ListAuditHandler handles GET /sites/{site_id}/audit.
 // Supports optional ?cursor= and ?limit= query parameters for cursor-based pagination.
-// Returns a JSON object with the audit entry keys for the current page plus a next_cursor
-// value that can be used to fetch the next page (empty string when no more pages exist).
+// Segment 11: also supports filtering via since_ns/until_ns/prefix/contains.
 func ListAuditHandler(w http.ResponseWriter, r *http.Request) {
 	sc, ok := site.FromContext(r.Context())
 	if !ok {
@@ -308,7 +318,12 @@ func ListAuditHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	keys, nextCursor, err := sc.Store.ListPage(bucketAudit, cursor, limit)
+	filter, ok := parseFilterParams(w, r)
+	if !ok {
+		return
+	}
+
+	keys, nextCursor, err := listFilteredPage(sc.Store, bucketAudit, cursor, limit, filter)
 	if err != nil {
 		slog.Error("failed to list audit entries", "site_id", sc.SiteID, "error", err)
 		http.Error(w, "failed to list audit entries", http.StatusInternalServerError)
@@ -446,4 +461,152 @@ func parsePaginationParams(w http.ResponseWriter, r *http.Request) (cursor strin
 	}
 	return cursor, limit, true
 }
+
+type listFilter struct {
+	SinceNS   *int64
+	UntilNS   *int64
+	Prefix    string
+	Contains  string
+	hasBounds bool
+}
+
+func parseFilterParams(w http.ResponseWriter, r *http.Request) (f listFilter, ok bool) {
+	q := r.URL.Query()
+
+	if raw := q.Get("since_ns"); raw != "" {
+		n, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || n < 0 {
+			http.Error(w, "since_ns must be a non-negative integer", http.StatusBadRequest)
+			return listFilter{}, false
+		}
+		f.SinceNS = &n
+		f.hasBounds = true
+	}
+	if raw := q.Get("until_ns"); raw != "" {
+		n, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || n < 0 {
+			http.Error(w, "until_ns must be a non-negative integer", http.StatusBadRequest)
+			return listFilter{}, false
+		}
+		f.UntilNS = &n
+		f.hasBounds = true
+	}
+
+	if f.SinceNS != nil && f.UntilNS != nil && *f.SinceNS > *f.UntilNS {
+		http.Error(w, "since_ns must be <= until_ns", http.StatusBadRequest)
+		return listFilter{}, false
+	}
+
+	f.Prefix = q.Get("prefix")
+	f.Contains = q.Get("contains")
+	return f, true
+}
+
+// keyNS extracts the nanosecond integer from keys like "<ns>.json".
+func keyNS(key string) (int64, bool) {
+	trim := strings.TrimSuffix(key, ".json")
+	if trim == key {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(trim, 10, 64)
+	if err != nil || n < 0 {
+		return 0, false
+	}
+	return n, true
+}
+
+func keyMatchesFilter(key string, f listFilter) bool {
+	if f.Prefix != "" && !strings.HasPrefix(key, f.Prefix) {
+		return false
+	}
+	if f.Contains != "" && !strings.Contains(key, f.Contains) {
+		return false
+	}
+
+	if f.hasBounds {
+		ns, ok := keyNS(key)
+		if !ok {
+			// If we cannot parse ns from the key, exclude it from ns-bounded results.
+			return false
+		}
+		if f.SinceNS != nil && ns < *f.SinceNS {
+			return false
+		}
+		if f.UntilNS != nil && ns > *f.UntilNS {
+			return false
+		}
+	}
+
+	return true
+}
+
+// listFilteredPage applies Segment 11 filtering BEFORE pagination.
+// cursor semantics remain: it means "start strictly after this key" in the filtered order.
+func listFilteredPage(store storage.Store, bucket, cursor string, limit int, f listFilter) (keys []string, nextCursor string, err error) {
+	all, err := store.List(bucket)
+	if err != nil {
+		return nil, "", err
+	}
+
+	// Move start index strictly after cursor in filtered order.
+	startIdx := 0
+	if cursor != "" {
+		// Find cursor in filtered list; start after it. If cursor is not found,
+		// behave like starting from the beginning (consistent with current behavior).
+		for i, k := range all {
+			if !keyMatchesFilter(k, f) {
+				continue
+			}
+			if k == cursor {
+				startIdx = i + 1
+				break
+			}
+		}
+	}
+
+	out := make([]string, 0, limit)
+
+	// Iterate from startIdx across raw keys, but only count filtered keys.
+	for i := startIdx; i < len(all) && len(out) < limit; i++ {
+		k := all[i]
+		if !keyMatchesFilter(k, f) {
+			continue
+		}
+		out = append(out, k)
+	}
+
+	// Determine nextCursor: it's the last returned key IF there exists at least one more filtered key after it.
+	if len(out) == 0 {
+		return []string{}, "", nil
+	}
+
+	last := out[len(out)-1]
+	// scan for any additional filtered key after 'last' in raw order
+	foundLast := false
+	hasMore := false
+	for _, k := range all {
+		if !keyMatchesFilter(k, f) {
+			continue
+		}
+		if !foundLast {
+			if k == last {
+				foundLast = true
+			}
+			continue
+		}
+		// any further filtered key means more pages
+		hasMore = true
+		break
+	}
+
+	if hasMore {
+		return out, last, nil
+	}
+	return out, "", nil
+}
+		
+
+
+
+
 
