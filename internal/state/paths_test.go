@@ -1,6 +1,7 @@
 package state_test
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -9,6 +10,8 @@ import (
 
 func TestStateRoot(t *testing.T) {
 	root := state.StateRoot("local")
+	root = filepath.ToSlash(root)
+
 	if !strings.HasSuffix(root, "local") {
 		t.Errorf("StateRoot = %q, expected to end with 'local'", root)
 	}
