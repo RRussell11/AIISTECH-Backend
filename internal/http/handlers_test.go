@@ -975,4 +975,208 @@ func TestPagination_ArtifactsAndAuditSupportCursor(t *testing.T) {
 	if len(entries) != 2 {
 		t.Errorf("audit page len = %d, want 2", len(entries))
 	}
+	// --- Segment 11: Filtering ---
+
+func TestFiltering_PrefixAndContains(t *testing.T) {
+	t.Chdir(t.TempDir())
+	router := newRouter(t)
+
+	// Create 3 events and record their keys.
+	var keys []string
+	for _, payload := range [][]byte{
+		[]byte(`{"msg":"keep-1"}`),
+		[]byte(`{"msg":"drop"}`),
+		[]byte(`{"msg":"keep-2"}`),
+	} {
+		rr := do(t, router, http.MethodPost, "/sites/local/events", payload)
+		if rr.Code != http.StatusCreated {
+			t.Fatalf("post: status=%d body=%s", rr.Code, rr.Body.String())
+		}
+		var body map[string]string
+		json.Unmarshal(rr.Body.Bytes(), &body) //nolint:errcheck
+		keys = append(keys, body["file"])
+	}
+
+	// prefix filter: use a stable prefix from one of the returned keys.
+	prefix := keys[1][:3]
+	rr := do(t, router, http.MethodGet, "/sites/local/events?prefix="+prefix, nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	var out map[string]any
+	json.Unmarshal(rr.Body.Bytes(), &out) //nolint:errcheck
+	events := out["events"].([]any)
+	if len(events) == 0 {
+		t.Fatalf("expected some events when filtering by prefix=%q", prefix)
+	}
+	for _, k := range events {
+		s := k.(string)
+		if !strings.HasPrefix(s, prefix) {
+			t.Fatalf("key %q does not match prefix %q", s, prefix)
+		}
+	}
+
+	// contains filter: ".json" should match all generated keys
+	rr2 := do(t, router, http.MethodGet, "/sites/local/events?contains=.json", nil)
+	if rr2.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr2.Code, rr2.Body.String())
+	}
+	var out2 map[string]any
+	json.Unmarshal(rr2.Body.Bytes(), &out2) //nolint:errcheck
+	events2 := out2["events"].([]any)
+	if len(events2) != 3 {
+		t.Fatalf("expected 3 events for contains=.json, got %d", len(events2))
+	}
+}
+
+func TestFiltering_SinceUntilInclusive(t *testing.T) {
+	t.Chdir(t.TempDir())
+	router := newRouter(t)
+
+	// Create 3 artifacts; capture filenames (ns-based).
+	var keys []string
+	for i := 0; i < 3; i++ {
+		rr := do(t, router, http.MethodPost, "/sites/local/artifacts", []byte(`{"x":1}`))
+		if rr.Code != http.StatusCreated {
+			t.Fatalf("post: status=%d body=%s", rr.Code, rr.Body.String())
+		}
+		var body map[string]string
+		json.Unmarshal(rr.Body.Bytes(), &body) //nolint:errcheck
+		keys = append(keys, body["file"])
+	}
+
+	parseNS := func(k string) int64 {
+		n, err := strconv.ParseInt(strings.TrimSuffix(k, ".json"), 10, 64)
+		if err != nil {
+			t.Fatalf("parse ns from %q: %v", k, err)
+		}
+		return n
+	}
+
+	ns0 := parseNS(keys[0])
+	ns1 := parseNS(keys[1])
+	ns2 := parseNS(keys[2])
+
+	// since_ns = ns1 should include keys[1] and keys[2] (inclusive)
+	rr := do(t, router, http.MethodGet, "/sites/local/artifacts?since_ns="+strconv.FormatInt(ns1, 10), nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	var out map[string]any
+	json.Unmarshal(rr.Body.Bytes(), &out) //nolint:errcheck
+	arts := out["artifacts"].([]any)
+	if len(arts) != 2 {
+		t.Fatalf("expected 2 artifacts since_ns=%d, got %d", ns1, len(arts))
+	}
+
+	// until_ns = ns1 should include keys[0] and keys[1] (inclusive)
+	rr2 := do(t, router, http.MethodGet, "/sites/local/artifacts?until_ns="+strconv.FormatInt(ns1, 10), nil)
+	if rr2.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr2.Code, rr2.Body.String())
+	}
+	var out2 map[string]any
+	json.Unmarshal(rr2.Body.Bytes(), &out2) //nolint:errcheck
+	arts2 := out2["artifacts"].([]any)
+	if len(arts2) != 2 {
+		t.Fatalf("expected 2 artifacts until_ns=%d, got %d", ns1, len(arts2))
+	}
+
+	// Exact bounds should include exactly keys[1]
+	rr3 := do(
+		t,
+		router,
+		http.MethodGet,
+		"/sites/local/artifacts?since_ns="+strconv.FormatInt(ns1, 10)+"&until_ns="+strconv.FormatInt(ns1, 10),
+		nil,
+	)
+	if rr3.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr3.Code, rr3.Body.String())
+	}
+	var out3 map[string]any
+	json.Unmarshal(rr3.Body.Bytes(), &out3) //nolint:errcheck
+	arts3 := out3["artifacts"].([]any)
+	if len(arts3) != 1 {
+		t.Fatalf("expected 1 artifact for exact bound, got %d", len(arts3))
+	}
+	if arts3[0].(string) != keys[1] {
+		t.Fatalf("expected %q, got %v", keys[1], arts3[0])
+	}
+
+	// Full bounds should include all
+	rr4 := do(
+		t,
+		router,
+		http.MethodGet,
+		"/sites/local/artifacts?since_ns="+strconv.FormatInt(ns0, 10)+"&until_ns="+strconv.FormatInt(ns2, 10),
+		nil,
+	)
+	if rr4.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr4.Code, rr4.Body.String())
+	}
+	var out4 map[string]any
+	json.Unmarshal(rr4.Body.Bytes(), &out4) //nolint:errcheck
+	arts4 := out4["artifacts"].([]any)
+	if len(arts4) != 3 {
+		t.Fatalf("expected 3 artifacts for full range, got %d", len(arts4))
+	}
+}
+
+func TestFiltering_InvalidBounds400(t *testing.T) {
+	t.Chdir(t.TempDir())
+	router := newRouter(t)
+
+	for _, url := range []string{
+		"/sites/local/events?since_ns=abc",
+		"/sites/local/events?until_ns=abc",
+		"/sites/local/events?since_ns=-1",
+		"/sites/local/events?until_ns=-1",
+		"/sites/local/events?since_ns=10&until_ns=9",
+	} {
+		rr := do(t, router, http.MethodGet, url, nil)
+		if rr.Code != http.StatusBadRequest {
+			t.Fatalf("GET %s: status=%d want 400; body=%s", url, rr.Code, rr.Body.String())
+		}
+	}
+}
+
+func TestFiltering_WithPagination(t *testing.T) {
+	t.Chdir(t.TempDir())
+	router := newRouter(t)
+
+	// Create 6 audit entries by posting 6 events.
+	for i := 0; i < 6; i++ {
+		rr := do(t, router, http.MethodPost, "/sites/local/events", []byte(`{"x":1}`))
+		if rr.Code != http.StatusCreated {
+			t.Fatalf("post: status=%d body=%s", rr.Code, rr.Body.String())
+		}
+	}
+
+	// Page 1: limit=2, filtered by contains=.json (matches all)
+	rr1 := do(t, router, http.MethodGet, "/sites/local/audit?contains=.json&limit=2", nil)
+	if rr1.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr1.Code, rr1.Body.String())
+	}
+	var b1 map[string]any
+	json.Unmarshal(rr1.Body.Bytes(), &b1) //nolint:errcheck
+	e1 := b1["entries"].([]any)
+	if len(e1) != 2 {
+		t.Fatalf("page1 len=%d want 2", len(e1))
+	}
+	c1 := b1["next_cursor"].(string)
+	if c1 == "" {
+		t.Fatalf("expected non-empty next_cursor on page1")
+	}
+
+	// Page 2
+	rr2 := do(t, router, http.MethodGet, "/sites/local/audit?contains=.json&limit=2&cursor="+c1, nil)
+	if rr2.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr2.Code, rr2.Body.String())
+	}
+	var b2 map[string]any
+	json.Unmarshal(rr2.Body.Bytes(), &b2) //nolint:errcheck
+	e2 := b2["entries"].([]any)
+	if len(e2) != 2 {
+		t.Fatalf("page2 len=%d want 2", len(e2))
+	}
+}
 }
