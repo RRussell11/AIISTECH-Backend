@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/RRussell11/AIISTECH-Backend/internal/audit"
 )
@@ -85,6 +86,10 @@ func TestWrite_MultipleEntriesDistinctKeys(t *testing.T) {
 		if err := audit.Write(audit.Entry{SiteID: "local", Status: 200}, s); err != nil {
 			t.Fatalf("Write %d: %v", i, err)
 		}
+
+		// On some systems (notably Windows), successive calls can land on the same
+		// clock tick, causing time-based keys to collide. Ensure time advances.
+		time.Sleep(time.Millisecond)
 	}
 
 	seen := make(map[string]bool)
