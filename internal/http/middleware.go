@@ -1,6 +1,7 @@
 package http
 
 import (
+	"context"
 	"expvar"
 	"fmt"
 	"log/slog"
@@ -15,12 +16,18 @@ import (
 	"github.com/RRussell11/AIISTECH-Backend/internal/config"
 	"github.com/RRussell11/AIISTECH-Backend/internal/site"
 	"github.com/RRussell11/AIISTECH-Backend/internal/storage"
+	"github.com/RRussell11/AIISTECH-Backend/internal/webhooks"
 )
 
 var (
 	metricsReqsBySite = expvar.NewMap("requests_by_site")
 	metricsReqsTotal  = expvar.NewInt("requests_total")
 )
+
+// dispatchTimeout is the maximum time AuditMiddleware will wait for
+// Dispatcher.Dispatch to accept an event into its internal queue. Delivery
+// itself is asynchronous and is not bounded by this timeout.
+const dispatchTimeout = 2 * time.Second
 
 // SiteMiddleware extracts {site_id} from the URL, resolves it against the
 // registry, opens the site's store, loads the per-site config (to obtain the
@@ -145,34 +152,52 @@ func (sr *statusRecorder) WriteHeader(code int) {
 }
 
 // AuditMiddleware automatically writes a structured audit entry for every
-// state-mutating (POST, PUT, PATCH, DELETE) site-scoped request.
+// state-mutating (POST, PUT, PATCH, DELETE) site-scoped request and, when d
+// is non-nil, dispatches a webhooks.Event of type "audit.write" for each
+// successful entry so that external subscribers are notified.
 // It must be placed after SiteMiddleware so that the site context is available.
-func AuditMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost && r.Method != http.MethodPut &&
-			r.Method != http.MethodPatch && r.Method != http.MethodDelete {
-			next.ServeHTTP(w, r)
-			return
-		}
-		sr := newStatusRecorder(w)
-		next.ServeHTTP(sr, r)
+func AuditMiddleware(d webhooks.Dispatcher) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost && r.Method != http.MethodPut &&
+				r.Method != http.MethodPatch && r.Method != http.MethodDelete {
+				next.ServeHTTP(w, r)
+				return
+			}
+			sr := newStatusRecorder(w)
+			next.ServeHTTP(sr, r)
 
-		sc, ok := site.FromContext(r.Context())
-		if !ok {
-			return
-		}
-		entry := auditpkg.Entry{
-			RequestID: chimiddleware.GetReqID(r.Context()),
-			SiteID:    sc.SiteID,
-			Method:    r.Method,
-			Path:      r.URL.Path,
-			Status:    sr.status,
-			Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
-		}
-		if err := auditpkg.Write(entry, sc.Store); err != nil {
-			slog.Error("failed to write audit entry", "site_id", sc.SiteID, "error", err)
-		}
-	})
+			sc, ok := site.FromContext(r.Context())
+			if !ok {
+				return
+			}
+			entry := auditpkg.Entry{
+				RequestID: chimiddleware.GetReqID(r.Context()),
+				SiteID:    sc.SiteID,
+				Method:    r.Method,
+				Path:      r.URL.Path,
+				Status:    sr.status,
+				Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
+			}
+			if err := auditpkg.Write(entry, sc.Store); err != nil {
+				slog.Error("failed to write audit entry", "site_id", sc.SiteID, "error", err)
+			}
+
+			if d != nil {
+				evt := webhooks.Event{
+					ID:        entry.RequestID,
+					Type:      "audit.write",
+					CreatedAt: time.Now().UTC(),
+					Data:      entry,
+				}
+				dispCtx, cancel := context.WithTimeout(context.Background(), dispatchTimeout)
+				defer cancel()
+				if err := d.Dispatch(dispCtx, evt); err != nil {
+					slog.Warn("failed to dispatch audit webhook", "site_id", sc.SiteID, "error", err)
+				}
+			}
+		})
+	}
 }
 
 // MetricsMiddleware increments per-request expvar counters for every request.

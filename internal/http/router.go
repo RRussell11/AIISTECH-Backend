@@ -8,10 +8,13 @@ import (
 
 	"github.com/RRussell11/AIISTECH-Backend/internal/site"
 	"github.com/RRussell11/AIISTECH-Backend/internal/storage"
+	"github.com/RRussell11/AIISTECH-Backend/internal/webhooks"
 )
 
 // NewRouter builds and returns the application HTTP router.
-func NewRouter(reg *site.Registry, stores *storage.Registry) http.Handler {
+// disp may be nil; when non-nil it receives an "audit.write" webhook event
+// for every state-mutating request processed by AuditMiddleware.
+func NewRouter(reg *site.Registry, stores *storage.Registry, disp webhooks.Dispatcher) http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.RequestID) // injects X-Request-Id for audit traceability
@@ -27,8 +30,8 @@ func NewRouter(reg *site.Registry, stores *storage.Registry) http.Handler {
 	// Site-scoped routes
 	r.Route("/sites/{site_id}", func(r chi.Router) {
 		r.Use(SiteMiddleware(reg, stores))
-		r.Use(AuthMiddleware)  // enforces Bearer token for mutating requests when site has api_key
-		r.Use(AuditMiddleware) // auto-audit all mutating requests
+		r.Use(AuthMiddleware)          // enforces Bearer token for mutating requests when site has api_key
+		r.Use(AuditMiddleware(disp))   // auto-audit all mutating requests; dispatches webhook when disp != nil
 		r.Get("/", GetSiteHandler)
 		r.Get("/healthz", SiteHealthzHandler)
 		r.Get("/config", GetConfigHandler)

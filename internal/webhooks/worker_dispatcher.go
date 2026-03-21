@@ -17,6 +17,11 @@ const (
 	defaultTimeoutSeconds = 5
 	defaultMaxAttempts    = 5
 	defaultWorkerCount    = 4
+
+	// subscriptionFetchTimeoutMultiplier scales the per-delivery timeout up for
+	// the subscription-listing call, which must complete before any delivery
+	// can begin and therefore benefits from a slightly longer budget.
+	subscriptionFetchTimeoutMultiplier = 2
 )
 
 // WorkerDispatcher is the concrete Dispatcher implementation. It maintains an
@@ -102,7 +107,7 @@ func (d *WorkerDispatcher) process(evt Event) {
 	// Give subscription fetching its own timeout separate from per-delivery timeout.
 	ctx, cancel := context.WithTimeout(
 		context.Background(),
-		time.Duration(d.cfg.TimeoutSeconds)*2*time.Second,
+		time.Duration(d.cfg.TimeoutSeconds*subscriptionFetchTimeoutMultiplier)*time.Second,
 	)
 	defer cancel()
 
