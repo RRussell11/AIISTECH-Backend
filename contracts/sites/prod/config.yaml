@@ -1,0 +1,5 @@
+site_id: prod
+api_key: prod-secret-change-me
+settings:
+  env: production
+  log_level: warn

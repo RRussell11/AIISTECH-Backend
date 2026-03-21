@@ -1,0 +1,5 @@
+site_id: staging
+api_key: staging-secret-change-me
+settings:
+  env: staging
+  log_level: info

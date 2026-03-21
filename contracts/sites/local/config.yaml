@@ -1,0 +1,4 @@
+site_id: local
+settings:
+  env: development
+  log_level: debug

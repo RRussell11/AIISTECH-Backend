@@ -1,0 +1,8 @@
+# Runtime state (anywhere in the tree)
+var/
+/var/state/
+
+# Go build output
+*.exe
+*.test
+*.out
