@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 )
+var auditSeq uint64
 
 // Entry is a structured audit log record written for every mutating site-scoped request.
 type Entry struct {
@@ -28,6 +29,18 @@ type Storer interface {
 func Write(e Entry, s Storer) error {
 	data, err := json.Marshal(e)
 	if err != nil {
+		return fmt.Errorf("marshalling audit entry: %w", err)
+	}
+
+	ns := time.Now().UnixNano()
+	seq := atomic.AddUint64(&auditSeq, 1)
+	key := fmt.Sprintf("%d-%d.json", ns, seq)
+
+	if err := s.Write("audit", key, data); err != nil {
+		return fmt.Errorf("writing audit entry: %w", err)
+	}
+	return nil
+}
 		return fmt.Errorf("marshalling audit entry: %w", err)
 	}
 	key := fmt.Sprintf("%d.json", time.Now().UnixNano())
