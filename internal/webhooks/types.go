@@ -1,8 +1,23 @@
-// Package webhooks defines the core domain types, interfaces, and helpers for
-// outbound webhook notification delivery (ADR-012, Segment 12).
+// Package webhooks provides the core domain types, interfaces, and concrete
+// implementations for outbound webhook notification delivery (ADR-012, Segment 12).
 //
-// This package is Step 1: types and contracts only. No HTTP delivery, no
-// subscription polling, and no wiring into handlers/middleware yet.
+// # Subscription fetching
+//
+// RemoteProvider implements Provider by calling the PhaseMirror-HQ daemon API:
+//
+//	GET /api/webhook-subscriptions?service=<s>&event_type=<t>
+//
+// # Delivery
+//
+// WorkerDispatcher implements Dispatcher using an internal worker pool.
+// Events are enqueued via Dispatch and delivered asynchronously with
+// exponential back-off retries and optional HMAC-SHA256 signing
+// (SignatureHeader).
+//
+// # Out of scope (future segments)
+//
+// Subscription caching/polling, middleware wiring, and handler integration
+// are deferred to later segments.
 package webhooks
 
 import "time"

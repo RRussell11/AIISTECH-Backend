@@ -1,6 +1,9 @@
 package webhooks
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // Dispatcher is the interface for asynchronous webhook delivery.
 //
@@ -55,4 +58,11 @@ type Config struct {
 	// A zero or negative value should be treated as a sensible default
 	// (e.g. 4 workers) by the implementation.
 	WorkerCount int
+
+	// RetryBackoff is an optional function that returns the wait duration
+	// before the next delivery attempt, given the 1-based index of the
+	// attempt that just failed. If nil, the implementation uses the default
+	// exponential back-off (1 s, 2 s, 4 s … capped at 30 s).
+	// Override in tests to avoid real sleeps.
+	RetryBackoff func(attempt int) time.Duration
 }
