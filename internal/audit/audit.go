@@ -7,15 +7,13 @@ import (
 	"time"
 )
 
-var auditSeq uint64
-
 type Entry struct {
-	RequestID  string `json:"request_id"`
-	SiteID     string `json:"site_id"`
-	Method     string `json:"method"`
-	Path       string `json:"path"`
-	Status     int    `json:"status"`
-	Timestamp  string `json:"timestamp"`
+	RequestID string `json:"request_id"`
+	SiteID    string `json:"site_id"`
+	Method    string `json:"method"`
+	Path      string `json:"path"`
+	Status    int    `json:"status"`
+	Timestamp string `json:"timestamp"`
 }
 
 // Storer is the write-side of any storage backend that can persist audit entries.
@@ -37,8 +35,8 @@ func Write(e Entry, s Storer) error {
 	}
 
 	ns := time.Now().UnixNano()
-seq := atomic.AddUint64(&auditSeq, 1)
-key := fmt.Sprintf("%d-%d.json", ns, seq)
+	seq := atomic.AddUint64(&auditSeq, 1)
+	key := fmt.Sprintf("%d-%d.json", ns, seq)
 
 	if err := s.Write("audit", key, data); err != nil {
 		return fmt.Errorf("writing audit entry: %w", err)
