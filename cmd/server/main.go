@@ -14,6 +14,7 @@ import (
 	sitehttp "github.com/RRussell11/AIISTECH-Backend/internal/http"
 	"github.com/RRussell11/AIISTECH-Backend/internal/site"
 	"github.com/RRussell11/AIISTECH-Backend/internal/storage"
+	"github.com/RRussell11/AIISTECH-Backend/internal/webhooks"
 )
 
 const defaultRegistryPath = "contracts/shared/sites.yaml"
@@ -47,12 +48,30 @@ func main() {
 
 	stores := storage.NewRegistry()
 
+	// Webhook dispatcher — optional. Configure via env vars:
+	//   AIISTECH_WEBHOOK_BASE_URL  — PhaseMirror-HQ subscriptions base URL
+	//   AIISTECH_WEBHOOK_TOKEN     — bearer token for subscription API (optional)
+	//   AIISTECH_SERVICE_NAME      — logical service name (default: "aiistech-backend")
+	var disp webhooks.Dispatcher
+	if webhookBase := os.Getenv("AIISTECH_WEBHOOK_BASE_URL"); webhookBase != "" {
+		serviceName := os.Getenv("AIISTECH_SERVICE_NAME")
+		if serviceName == "" {
+			serviceName = "aiistech-backend"
+		}
+		provider := webhooks.NewRemoteProvider(webhookBase, os.Getenv("AIISTECH_WEBHOOK_TOKEN"), 0)
+		wd := webhooks.NewWorkerDispatcher(webhooks.Config{
+			ServiceName: serviceName,
+		}, provider)
+		disp = wd
+		slog.Info("webhook dispatcher started", "service", serviceName, "base_url", webhookBase)
+	}
+
 	addr := defaultAddr
 	if v := os.Getenv("AIISTECH_ADDR"); v != "" {
 		addr = v
 	}
 
-	router := sitehttp.NewRouter(reg, stores)
+	router := sitehttp.NewRouter(reg, stores, disp)
 
 	srv := &http.Server{
 		Addr:    addr,
@@ -81,6 +100,11 @@ func main() {
 		os.Exit(1)
 	}
 
+	if disp != nil {
+		if err := disp.Close(); err != nil {
+			slog.Error("webhook dispatcher close failed", "error", err)
+		}
+	}
 	stores.CloseAll()
 	slog.Info("server stopped")
 }
