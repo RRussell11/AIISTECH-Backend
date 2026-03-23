@@ -51,26 +51,31 @@ func main() {
 	stores := storage.NewRegistry()
 
 	// Webhook dispatcher — optional. Configure via env vars:
-	//   AIISTECH_WEBHOOK_BASE_URL          — PhaseMirror-HQ subscriptions base URL
-	//   AIISTECH_WEBHOOK_TOKEN             — bearer token for subscription API (optional)
-	//   AIISTECH_SERVICE_NAME              — logical service name (default: "aiistech-backend")
-	//   AIISTECH_WEBHOOK_CACHE_TTL_SECONDS — subscription cache TTL in seconds (default: 30)
+	//   AIISTECH_WEBHOOK_BASE_URL                — PhaseMirror-HQ subscriptions base URL
+	//   AIISTECH_WEBHOOK_TOKEN                   — bearer token for subscription API (optional)
+	//   AIISTECH_SERVICE_NAME                    — logical service name (default: "aiistech-backend")
+	//   AIISTECH_WEBHOOK_CACHE_TTL_SECONDS       — subscription cache TTL in seconds (default: 30)
+	//   AIISTECH_WEBHOOK_POLL_INTERVAL_SECONDS   — background subscription poll interval in seconds (default: 0 = disabled)
 	var disp webhooks.Dispatcher
+	var provider *webhooks.CachingProvider
 	if webhookBase := os.Getenv("AIISTECH_WEBHOOK_BASE_URL"); webhookBase != "" {
 		serviceName := os.Getenv("AIISTECH_SERVICE_NAME")
 		if serviceName == "" {
 			serviceName = "aiistech-backend"
 		}
 		cacheTTL := time.Duration(envInt64("AIISTECH_WEBHOOK_CACHE_TTL_SECONDS", 30)) * time.Second
-		provider := webhooks.NewCachingProvider(
+		pollInterval := time.Duration(envInt64("AIISTECH_WEBHOOK_POLL_INTERVAL_SECONDS", 0)) * time.Second
+		provider = webhooks.NewCachingProvider(
 			webhooks.NewRemoteProvider(webhookBase, os.Getenv("AIISTECH_WEBHOOK_TOKEN"), 0),
 			cacheTTL,
+			pollInterval,
 		)
 		wd := webhooks.NewWorkerDispatcher(webhooks.Config{
 			ServiceName: serviceName,
 		}, provider)
 		disp = wd
-		slog.Info("webhook dispatcher started", "service", serviceName, "base_url", webhookBase, "cache_ttl", cacheTTL)
+		slog.Info("webhook dispatcher started", "service", serviceName, "base_url", webhookBase,
+			"cache_ttl", cacheTTL, "poll_interval", pollInterval)
 	}
 
 	addr := defaultAddr
@@ -126,6 +131,11 @@ func main() {
 		os.Exit(1)
 	}
 
+	if provider != nil {
+		if err := provider.Close(); err != nil {
+			slog.Error("webhook subscription provider close failed", "error", err)
+		}
+	}
 	if disp != nil {
 		if err := disp.Close(); err != nil {
 			slog.Error("webhook dispatcher close failed", "error", err)

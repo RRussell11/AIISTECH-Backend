@@ -14,10 +14,12 @@
 // exponential back-off retries and optional HMAC-SHA256 signing
 // (SignatureHeader).
 //
-// # Out of scope (future segments)
+// # Caching and polling
 //
-// Subscription caching/polling, middleware wiring, and handler integration
-// are deferred to later segments.
+// CachingProvider (Segment 11C/13) wraps any Provider and keeps subscription
+// lists in memory for a configurable TTL. An optional background polling
+// goroutine (Segment 13) keeps the cache warm by proactively re-fetching known
+// keys on a configurable interval, eliminating dispatch-path latency spikes.
 package webhooks
 
 import "time"

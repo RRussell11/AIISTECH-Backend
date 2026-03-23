@@ -65,6 +65,7 @@ The server reads the site registry from `contracts/shared/sites.yaml` on startup
 | `AIISTECH_WEBHOOK_TOKEN` | *(none)* | Bearer token for the webhook subscription API. |
 | `AIISTECH_SERVICE_NAME` | `aiistech-backend` | Logical service name used when registering with PhaseMirror-HQ. |
 | `AIISTECH_WEBHOOK_CACHE_TTL_SECONDS` | `30` | TTL (seconds) for the per-`(service, eventType, tenantID)` subscription cache. Reduces load on the PhaseMirror-HQ API when many events fire in quick succession. |
+| `AIISTECH_WEBHOOK_POLL_INTERVAL_SECONDS` | `0` (disabled) | Background subscription poll interval in seconds. When positive, a goroutine proactively refreshes all known cache keys at this interval, keeping the cache warm so dispatch never blocks on an HTTP fetch. `0` disables background polling (lazy-only mode). |
 
 ## Project Structure
 
@@ -602,6 +603,45 @@ AIISTECH_WEBHOOK_CACHE_TTL_SECONDS=10 go run ./cmd/server
 
 ```bash
 AIISTECH_WEBHOOK_CACHE_TTL_SECONDS=1 go run ./cmd/server
+```
+
+---
+
+### Segment 13 — Background Subscription Polling
+
+`CachingProvider` (Segment 11C) uses lazy eviction: subscriptions are re-fetched
+only after a cache entry expires and the next event dispatch triggers a miss.
+Under sustained event bursts this produces brief dispatch-path latency spikes
+every TTL interval, and multiple concurrent workers can all miss simultaneously.
+
+Segment 13 adds an **optional background polling goroutine** inside
+`CachingProvider` that proactively re-fetches every known cache key on a
+configurable interval. The goroutine runs only when
+`AIISTECH_WEBHOOK_POLL_INTERVAL_SECONDS > 0` and is stopped cleanly on
+shutdown via `CachingProvider.Close()`.
+
+**Behaviour:**
+
+- Background goroutine starts at construction time when `pollInterval > 0`;
+  zero means lazy-only (Segment 11C behaviour, the default).
+- Only keys that have been seen at least once (populated on a first lazy miss)
+  are refreshed by the poller.
+- On a poll error the existing valid cache entry is **preserved** and the error
+  is logged at WARN; a transient HQ outage does not disrupt active dispatch.
+- `Close()` on `CachingProvider` signals the goroutine to stop and blocks until
+  it exits. In `main.go` this runs before `Dispatcher.Close()` to ensure no
+  in-flight deliveries encounter a torn-down provider.
+
+**Example — enable background polling every 20 seconds:**
+
+```bash
+AIISTECH_WEBHOOK_POLL_INTERVAL_SECONDS=20 go run ./cmd/server
+```
+
+**Example — polling with a longer TTL (cache acts as a fallback, not a gate):**
+
+```bash
+AIISTECH_WEBHOOK_CACHE_TTL_SECONDS=120 AIISTECH_WEBHOOK_POLL_INTERVAL_SECONDS=60 go run ./cmd/server
 ```
 
 ---
