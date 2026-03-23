@@ -2,15 +2,21 @@ package http
 
 import (
 	"context"
+	"encoding/json"
 	"expvar"
 	"fmt"
 	"log/slog"
+	"math"
+	"net"
 	"net/http"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
+	"golang.org/x/time/rate"
 
 	auditpkg "github.com/RRussell11/AIISTECH-Backend/internal/audit"
 	"github.com/RRussell11/AIISTECH-Backend/internal/config"
@@ -209,5 +215,144 @@ func MetricsMiddleware(next http.Handler) http.Handler {
 			metricsReqsBySite.Add(sc.SiteID, 1)
 		}
 	})
+}
+
+// CORSMiddleware adds CORS response headers for the allowed origins.
+// When allowOrigins is empty, no CORS headers are written.
+// When allowOrigins contains "*", all origins are permitted.
+// Otherwise only exact-match origins receive the header.
+func CORSMiddleware(allowOrigins []string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if len(allowOrigins) == 0 {
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			origin := r.Header.Get("Origin")
+			allowed := ""
+			for _, o := range allowOrigins {
+				if o == "*" || o == origin {
+					allowed = o
+					break
+				}
+			}
+
+			if allowed != "" {
+				w.Header().Set("Access-Control-Allow-Origin", allowed)
+				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+				w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+			}
+
+			if r.Method == http.MethodOptions {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// MaxBodyMiddleware limits the request body size to maxBytes for mutating
+// requests (POST, PUT, PATCH, DELETE). Requests exceeding the limit receive a
+// 413 JSON response. ReadAll in handlers will also enforce this via the reader.
+func MaxBodyMiddleware(maxBytes int64) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.Method {
+			case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+				r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// ipLimiter holds a rate.Limiter for a single IP address.
+type ipLimiter struct {
+	limiter  *rate.Limiter
+	lastSeen time.Time
+}
+
+// rateLimitStore holds per-IP rate limiters and a background cleanup goroutine.
+type rateLimitStore struct {
+	mu       sync.Mutex
+	limiters map[string]*ipLimiter
+	rps      rate.Limit
+	burst    int
+}
+
+func newRateLimitStore(rps float64, burst int) *rateLimitStore {
+	s := &rateLimitStore{
+		limiters: make(map[string]*ipLimiter),
+		rps:      rate.Limit(rps),
+		burst:    burst,
+	}
+	go s.cleanup()
+	return s
+}
+
+// get returns the rate.Limiter for the given IP, creating one if needed.
+func (s *rateLimitStore) get(ip string) *rate.Limiter {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	il, ok := s.limiters[ip]
+	if !ok {
+		il = &ipLimiter{limiter: rate.NewLimiter(s.rps, s.burst)}
+		s.limiters[ip] = il
+	}
+	il.lastSeen = time.Now()
+	return il.limiter
+}
+
+// cleanup removes stale IP entries every minute to prevent unbounded growth.
+func (s *rateLimitStore) cleanup() {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for range ticker.C {
+		cutoff := time.Now().Add(-5 * time.Minute)
+		s.mu.Lock()
+		for ip, il := range s.limiters {
+			if il.lastSeen.Before(cutoff) {
+				delete(s.limiters, ip)
+			}
+		}
+		s.mu.Unlock()
+	}
+}
+
+// RateLimitMiddleware enforces a per-IP token-bucket rate limit for mutating
+// requests (POST, PUT, PATCH, DELETE). Requests exceeding the limit receive a
+// 429 JSON response with a Retry-After header. rps is the sustained rate
+// (requests per second) and burst is the maximum burst size.
+func RateLimitMiddleware(rps float64, burst int) func(http.Handler) http.Handler {
+	store := newRateLimitStore(rps, burst)
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.Method {
+			case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+				// best-effort IP extraction
+				ip, _, err := net.SplitHostPort(r.RemoteAddr)
+				if err != nil {
+					ip = r.RemoteAddr
+				}
+				reservation := store.get(ip).Reserve()
+				if delay := reservation.Delay(); delay > 0 {
+					reservation.Cancel() // do not consume a token
+					retryAfter := int(math.Ceil(delay.Seconds()))
+					if retryAfter < 1 {
+						retryAfter = 1
+					}
+					w.Header().Set("Content-Type", "application/json")
+					w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+					w.WriteHeader(http.StatusTooManyRequests)
+					json.NewEncoder(w).Encode(map[string]string{"error": "rate limit exceeded"}) //nolint:errcheck
+					return
+				}
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
 }
 

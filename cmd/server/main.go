@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -71,11 +73,30 @@ func main() {
 		addr = v
 	}
 
-	router := sitehttp.NewRouter(reg, stores, disp)
+	// Ops middleware configuration.
+	opsCfg := sitehttp.OpsConfig{
+		MaxBodyBytes:   envInt64("AIISTECH_MAX_BODY_BYTES", 1<<20),
+		RateLimitRPS:   envFloat64("AIISTECH_RATE_LIMIT_RPS", 10),
+		RateLimitBurst: int(envInt64("AIISTECH_RATE_LIMIT_BURST", 20)),
+	}
+	if origins := os.Getenv("AIISTECH_CORS_ALLOW_ORIGINS"); origins != "" {
+		for _, o := range strings.Split(origins, ",") {
+			o = strings.TrimSpace(o)
+			if o != "" {
+				opsCfg.CORSAllowOrigins = append(opsCfg.CORSAllowOrigins, o)
+			}
+		}
+	}
+
+	router := sitehttp.NewRouter(reg, stores, disp, opsCfg)
 
 	srv := &http.Server{
-		Addr:    addr,
-		Handler: router,
+		Addr:              addr,
+		Handler:           router,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -107,5 +128,29 @@ func main() {
 	}
 	stores.CloseAll()
 	slog.Info("server stopped")
+}
+
+// envInt64 reads an environment variable as int64, returning fallback on error or absence.
+func envInt64(key string, fallback int64) int64 {
+	if v := os.Getenv(key); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err == nil && n > 0 {
+			return n
+		}
+		slog.Warn("invalid env value, using default", "key", key, "value", v)
+	}
+	return fallback
+}
+
+// envFloat64 reads an environment variable as float64, returning fallback on error or absence.
+func envFloat64(key string, fallback float64) float64 {
+	if v := os.Getenv(key); v != "" {
+		f, err := strconv.ParseFloat(v, 64)
+		if err == nil && f > 0 {
+			return f
+		}
+		slog.Warn("invalid env value, using default", "key", key, "value", v)
+	}
+	return fallback
 }
 
