@@ -23,6 +23,8 @@ All stateful operations are scoped by an explicit `site_id`.
   - [Segment 9 — Pagination](#segment-9--pagination)
   - [Segment 10 — Docker & CI/CD](#segment-10--docker--cicd)
   - [Segment 11A — Ops Hardening](#segment-11a--ops-hardening)
+  - [Segment 11B — List Filtering](#segment-11b--list-filtering)
+  - [Segment 11C — Webhook Subscription Caching](#segment-11c--webhook-subscription-caching)
 - [Roadmap](#roadmap)
 - [Tests](#tests)
 
@@ -62,6 +64,7 @@ The server reads the site registry from `contracts/shared/sites.yaml` on startup
 | `AIISTECH_WEBHOOK_BASE_URL` | *(disabled)* | PhaseMirror-HQ subscription API base URL. When set, audit events are dispatched as webhooks. |
 | `AIISTECH_WEBHOOK_TOKEN` | *(none)* | Bearer token for the webhook subscription API. |
 | `AIISTECH_SERVICE_NAME` | `aiistech-backend` | Logical service name used when registering with PhaseMirror-HQ. |
+| `AIISTECH_WEBHOOK_CACHE_TTL_SECONDS` | `30` | TTL (seconds) for the per-`(service, eventType, tenantID)` subscription cache. Reduces load on the PhaseMirror-HQ API when many events fire in quick succession. |
 
 ## Project Structure
 
@@ -534,6 +537,72 @@ go build \
 ```
 
 Fields default to empty strings when built without the flags.
+
+---
+
+### Segment 11B — List Filtering
+
+All three list endpoints (`/events`, `/artifacts`, `/audit`) support additional query parameters for server-side filtering. Filters are applied _before_ pagination, so `limit` and `next_cursor` always reflect the filtered result set.
+
+**Filter query parameters:**
+
+| Parameter | Type | Description |
+|---|---|---|
+| `since_ns` | int (nanoseconds) | Return only keys with a nanosecond timestamp ≥ this value. |
+| `until_ns` | int (nanoseconds) | Return only keys with a nanosecond timestamp ≤ this value. |
+| `prefix` | string | Return only keys whose filename starts with this string. |
+| `contains` | string | Return only keys whose filename contains this string. |
+
+All parameters are optional and combinable. Keys that do not parse as `<nanosecond>.json` are excluded when `since_ns` or `until_ns` is provided.
+
+**Example — events written in the last hour:**
+
+```bash
+since=$(( ($(date +%s) - 3600) * 1000000000 ))
+curl "http://localhost:8080/sites/local/events?since_ns=${since}"
+# {"events":["...nanosecond....json"],"next_cursor":"","site_id":"local"}
+```
+
+**Example — first 10 artifacts whose filename contains "build":**
+
+```bash
+curl "http://localhost:8080/sites/local/artifacts?contains=build&limit=10"
+```
+
+**Error responses:**
+
+| Condition | Status |
+|---|---|
+| `since_ns` or `until_ns` is not a non-negative integer | `400 Bad Request` |
+| `since_ns` > `until_ns` | `400 Bad Request` |
+
+---
+
+### Segment 11C — Webhook Subscription Caching
+
+When `AIISTECH_WEBHOOK_BASE_URL` is set, the webhook dispatcher fetches active subscriptions from PhaseMirror-HQ before each delivery. Without caching this produces one HTTP round-trip to the subscription API _per event per worker_. Under sustained load (e.g. many rapid deploys) this would hit the upstream API harder than necessary.
+
+Segment 11C wraps `RemoteProvider` in a `CachingProvider` that retains subscription lists in memory for a configurable TTL. Subsequent events within the TTL window read from the cache without calling the API.
+
+**Behaviour:**
+
+- Cache key: `(service, eventType, tenantID)` — distinct event types are cached independently.
+- TTL: controlled by `AIISTECH_WEBHOOK_CACHE_TTL_SECONDS` (default **30 s**).
+- Errors from the upstream API are **not** cached; the next event will retry immediately.
+- Eviction is lazy (on the next read after expiry); no background goroutine is added.
+- The implementation is safe for concurrent use by all dispatcher workers.
+
+**Example — reduce cache TTL for high-churn environments:**
+
+```bash
+AIISTECH_WEBHOOK_CACHE_TTL_SECONDS=10 go run ./cmd/server
+```
+
+**Example — disable effective caching (cache for 1 second) for debugging:**
+
+```bash
+AIISTECH_WEBHOOK_CACHE_TTL_SECONDS=1 go run ./cmd/server
+```
 
 ---
 

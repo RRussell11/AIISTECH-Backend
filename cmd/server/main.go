@@ -51,21 +51,26 @@ func main() {
 	stores := storage.NewRegistry()
 
 	// Webhook dispatcher — optional. Configure via env vars:
-	//   AIISTECH_WEBHOOK_BASE_URL  — PhaseMirror-HQ subscriptions base URL
-	//   AIISTECH_WEBHOOK_TOKEN     — bearer token for subscription API (optional)
-	//   AIISTECH_SERVICE_NAME      — logical service name (default: "aiistech-backend")
+	//   AIISTECH_WEBHOOK_BASE_URL          — PhaseMirror-HQ subscriptions base URL
+	//   AIISTECH_WEBHOOK_TOKEN             — bearer token for subscription API (optional)
+	//   AIISTECH_SERVICE_NAME              — logical service name (default: "aiistech-backend")
+	//   AIISTECH_WEBHOOK_CACHE_TTL_SECONDS — subscription cache TTL in seconds (default: 30)
 	var disp webhooks.Dispatcher
 	if webhookBase := os.Getenv("AIISTECH_WEBHOOK_BASE_URL"); webhookBase != "" {
 		serviceName := os.Getenv("AIISTECH_SERVICE_NAME")
 		if serviceName == "" {
 			serviceName = "aiistech-backend"
 		}
-		provider := webhooks.NewRemoteProvider(webhookBase, os.Getenv("AIISTECH_WEBHOOK_TOKEN"), 0)
+		cacheTTL := time.Duration(envInt64("AIISTECH_WEBHOOK_CACHE_TTL_SECONDS", 30)) * time.Second
+		provider := webhooks.NewCachingProvider(
+			webhooks.NewRemoteProvider(webhookBase, os.Getenv("AIISTECH_WEBHOOK_TOKEN"), 0),
+			cacheTTL,
+		)
 		wd := webhooks.NewWorkerDispatcher(webhooks.Config{
 			ServiceName: serviceName,
 		}, provider)
 		disp = wd
-		slog.Info("webhook dispatcher started", "service", serviceName, "base_url", webhookBase)
+		slog.Info("webhook dispatcher started", "service", serviceName, "base_url", webhookBase, "cache_ttl", cacheTTL)
 	}
 
 	addr := defaultAddr
@@ -153,4 +158,3 @@ func envFloat64(key string, fallback float64) float64 {
 	}
 	return fallback
 }
-
