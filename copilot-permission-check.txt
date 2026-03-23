@@ -1,0 +1,4 @@
+Copilot permission check
+Date: 2026-03-23
+Repo: RRussell11/AIISTECH-Backend
+Branch: copilot-permission-check
