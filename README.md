@@ -614,11 +614,18 @@ only after a cache entry expires and the next event dispatch triggers a miss.
 Under sustained event bursts this produces brief dispatch-path latency spikes
 every TTL interval, and multiple concurrent workers can all miss simultaneously.
 
-Segment 13 adds an **optional background polling goroutine** inside
-`CachingProvider` that proactively re-fetches every known cache key on a
-configurable interval. The goroutine runs only when
-`AIISTECH_WEBHOOK_POLL_INTERVAL_SECONDS > 0` and is stopped cleanly on
-shutdown via `CachingProvider.Close()`.
+Segment 13 adds two complementary improvements to `CachingProvider`:
+
+1. **Background polling goroutine** — proactively re-fetches every known cache
+   key on a configurable interval so the dispatch hot path is always a cache hit
+   once warmed. Runs only when `AIISTECH_WEBHOOK_POLL_INTERVAL_SECONDS > 0` and
+   is stopped cleanly on shutdown via `CachingProvider.Close()`.
+
+2. **Singleflight coalescing** — concurrent cache misses for the same
+   `(service, eventType, tenantID)` key are deduplicated with
+   `golang.org/x/sync/singleflight`: even at cold start, at most **one** outbound
+   call is made to PhaseMirror-HQ per key regardless of how many goroutines race
+   simultaneously. This eliminates the thundering-herd effect on TTL expiry.
 
 **Behaviour:**
 

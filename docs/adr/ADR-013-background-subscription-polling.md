@@ -56,7 +56,8 @@ Key design choices:
 Use `golang.org/x/sync/singleflight` to coalesce concurrent misses so only one
 goroutine calls HQ per key. Eliminates the thundering herd but does **not**
 eliminate cold-start latency on the dispatch path. Chosen as a complementary
-measure, not a substitute.
+measure, not a substitute. **Implemented alongside background polling** — see
+`ListSubscriptions` in `caching_provider.go`.
 
 **B — Increase default TTL**  
 A longer TTL (e.g. 5 min) reduces miss frequency without adding a goroutine.
@@ -79,6 +80,9 @@ protocol changes on the HQ side and a new inbound endpoint here. Deferred.
 - PhaseMirror-HQ subscription API load becomes **predictable and steady**
   (`n_keys / pollInterval` requests/s) instead of bursty.
 - Thundering herd on TTL expiry is eliminated.
+- Concurrent cache misses for the same key are coalesced by singleflight so
+  that at most **one** outbound call is made to HQ per key, even before the
+  background poller has warmed the cache.
 - `Close()` on `CachingProvider` integrates cleanly with the existing shutdown
   sequence in `main.go` (dispatcher is closed before stores).
 
@@ -102,11 +106,15 @@ protocol changes on the HQ side and a new inbound endpoint here. Deferred.
    `stopCh chan struct{}` channel, and a `Close()` method. When `pollInterval > 0`,
    start a background goroutine in `NewCachingProvider` that ticks every
    `pollInterval` and calls `inner.ListSubscriptions` for every key currently in
-   the cache, updating entries on success.
+   the cache, updating entries on success. Add a `singleflight.Group` to
+   `CachingProvider` and wrap the cache-miss path in `ListSubscriptions` with
+   `sf.Do` so concurrent misses for the same key are coalesced into a single
+   outbound call. ✅
 2. **`internal/webhooks/caching_provider_test.go`** — add tests for: background
    goroutine populates cache without a dispatch call; `Close()` stops the
-   goroutine; transient provider error during poll does not evict valid entry.
+   goroutine; transient provider error during poll does not evict valid entry;
+   concurrent cache misses are coalesced by singleflight. ✅
 3. **`cmd/server/main.go`** — read `AIISTECH_WEBHOOK_POLL_INTERVAL_SECONDS` and
    pass it to `NewCachingProvider`. Call `provider.Close()` in the shutdown
-   sequence before `disp.Close()`.
-4. **`README.md`** — add Segment 13 section; add env var to the table.
+   sequence before `disp.Close()`. ✅
+4. **`README.md`** — add Segment 13 section; add env var to the table. ✅

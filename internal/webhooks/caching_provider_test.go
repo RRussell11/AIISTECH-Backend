@@ -211,6 +211,75 @@ func TestCachingProvider_CloseStopsPoller(t *testing.T) {
 	}
 }
 
+// TestCachingProvider_SingleflightCoalescesOnCacheMiss verifies that when many
+// goroutines concurrently observe a cache miss for the same key, the inner
+// provider is called exactly once (all callers share the single in-flight
+// result via singleflight).
+func TestCachingProvider_SingleflightCoalescesOnCacheMiss(t *testing.T) {
+	const goroutines = 20
+
+	// gate holds the inner call open until all goroutines have entered sf.Do.
+	gate := make(chan struct{})
+	inner := &gatedProvider{
+		subs: []Subscription{{ID: "sf-sub", Enabled: true}},
+		gate: gate,
+	}
+	cp := NewCachingProvider(inner, time.Hour, 0)
+
+	// Release all goroutines at the same moment so they all race on the same
+	// cache key before the first inner call has had a chance to return.
+	ready := make(chan struct{})
+	var wg sync.WaitGroup
+	results := make([][]Subscription, goroutines)
+	errs := make([]error, goroutines)
+	for i := 0; i < goroutines; i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-ready
+			results[i], errs[i] = cp.ListSubscriptions(context.Background(), "svc", "audit.write", "")
+		}()
+	}
+
+	close(ready)                      // release all goroutines simultaneously
+	time.Sleep(20 * time.Millisecond) // let them pile up inside sf.Do
+	close(gate)                       // allow the single in-flight call to complete
+
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("goroutine %d: unexpected error: %v", i, err)
+		}
+	}
+	for i, subs := range results {
+		if len(subs) != 1 || subs[0].ID != "sf-sub" {
+			t.Errorf("goroutine %d: unexpected result: %v", i, subs)
+		}
+	}
+	// The inner provider should have been called exactly once despite the
+	// many concurrent callers — that is the whole point of singleflight.
+	if got := atomic.LoadInt64(&inner.calls); got != 1 {
+		t.Errorf("inner called %d times, want 1 (singleflight should coalesce concurrent misses)", got)
+	}
+}
+
+// gatedProvider is a test Provider that blocks every ListSubscriptions call
+// until its gate channel is closed, allowing concurrent callers to pile up
+// inside singleflight before the result is available.
+type gatedProvider struct {
+	calls int64
+	subs  []Subscription
+	gate  <-chan struct{}
+}
+
+func (p *gatedProvider) ListSubscriptions(_ context.Context, _, _, _ string) ([]Subscription, error) {
+	atomic.AddInt64(&p.calls, 1)
+	<-p.gate
+	return p.subs, nil
+}
+
 // TestCachingProvider_PollErrorDoesNotEvictValidEntry verifies that when the
 // background poller receives an error from the inner provider it does not
 // evict or overwrite the existing valid cache entry.

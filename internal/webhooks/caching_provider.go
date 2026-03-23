@@ -2,9 +2,12 @@ package webhooks
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
+
+	"golang.org/x/sync/singleflight"
 )
 
 // cacheKey is the composite cache key for subscription lookups.
@@ -29,6 +32,10 @@ type cacheEntry struct {
 // that interval, keeping the cache warm so the dispatch hot path never blocks
 // on an outbound HTTP call. Call Close to stop the goroutine gracefully.
 //
+// Concurrent cache misses for the same (service, eventType, tenantID) key are
+// coalesced via singleflight: only one outbound call to the inner Provider is
+// made regardless of how many goroutines race on the same key simultaneously.
+//
 // The cache is keyed per (service, eventType, tenantID) tuple. Entries are
 // evicted lazily on the next read after they expire. Errors from the inner
 // provider are never cached, so a transient failure causes an immediate retry
@@ -41,6 +48,7 @@ type CachingProvider struct {
 	pollInterval time.Duration
 	mu           sync.RWMutex
 	cache        map[cacheKey]cacheEntry
+	sf           singleflight.Group
 	stopCh       chan struct{}
 	closeOnce    sync.Once
 	wg           sync.WaitGroup
@@ -75,7 +83,9 @@ func NewCachingProvider(inner Provider, ttl, pollInterval time.Duration) *Cachin
 // ListSubscriptions returns subscriptions from the in-memory cache when a
 // non-expired entry exists for the (service, eventType, tenantID) triple.
 // On a cache miss or expiry it delegates to the inner Provider, stores the
-// result, and returns it. Errors from the inner Provider are not cached.
+// result, and returns it. Concurrent misses for the same key are coalesced via
+// singleflight so that only one outbound call is made regardless of how many
+// goroutines race simultaneously. Errors from the inner Provider are not cached.
 func (c *CachingProvider) ListSubscriptions(ctx context.Context, service, eventType, tenantID string) ([]Subscription, error) {
 	k := cacheKey{service: service, eventType: eventType, tenantID: tenantID}
 	now := time.Now()
@@ -89,15 +99,21 @@ func (c *CachingProvider) ListSubscriptions(ctx context.Context, service, eventT
 	}
 	c.mu.RUnlock()
 
-	// Cache miss or expired entry: call the inner provider.
-	subs, err := c.inner.ListSubscriptions(ctx, service, eventType, tenantID)
+	// Cache miss or expired: coalesce concurrent callers for the same key so
+	// only one outbound HTTP call is made to the inner Provider.
+	sfKey := fmt.Sprintf("%s\x00%s\x00%s", service, eventType, tenantID)
+	v, err, _ := c.sf.Do(sfKey, func() (interface{}, error) {
+		return c.inner.ListSubscriptions(ctx, service, eventType, tenantID)
+	})
 	if err != nil {
 		return nil, err
 	}
 
+	subs := v.([]Subscription)
+
 	// Store the fresh result; write lock required.
 	c.mu.Lock()
-	c.cache[k] = cacheEntry{subs: subs, expiresAt: now.Add(c.ttl)}
+	c.cache[k] = cacheEntry{subs: subs, expiresAt: time.Now().Add(c.ttl)}
 	c.mu.Unlock()
 
 	return subs, nil
