@@ -195,6 +195,7 @@ func (d *WorkerDispatcher) deliverWithRetry(sub Subscription, evt Event, bodyByt
 			TenantID:       evt.TenantID,
 			SubscriptionID: sub.ID,
 			URL:            sub.URL,
+			Secret:         sub.Secret,
 			Payload:        bodyBytes,
 			AttemptCount:   d.cfg.MaxAttempts,
 			LastError:      lastErr.Error(),

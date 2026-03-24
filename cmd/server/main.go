@@ -72,7 +72,7 @@ func main() {
 		addr = v
 	}
 
-	router := sitehttp.NewRouter(reg, stores, disp)
+	router := sitehttp.NewRouter(reg, stores, disp, nil)
 
 	srv := &http.Server{
 		Addr:    addr,

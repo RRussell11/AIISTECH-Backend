@@ -54,6 +54,11 @@ type DLQRecord struct {
 	// URL is the subscriber endpoint that rejected or was unreachable.
 	URL string `json:"url"`
 
+	// Secret is the optional HMAC-SHA256 signing secret of the subscription.
+	// Preserved so the replay handler can re-sign with the same scheme used
+	// during the original delivery (ADR-016, Segment 16).
+	Secret string `json:"secret,omitempty"`
+
 	// Payload is the JSON-serialised event body that was attempted.
 	Payload []byte `json:"payload"`
 
