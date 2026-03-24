@@ -44,6 +44,9 @@ func NewRouter(reg *site.Registry, stores *storage.Registry, disp webhooks.Dispa
 		r.Delete("/artifacts/{filename}", DeleteArtifactHandler)
 		r.Get("/audit", ListAuditHandler)
 		r.Get("/audit/{filename}", GetAuditHandler)
+		r.Get("/webhooks/dlq", ListDLQHandler)
+		r.Get("/webhooks/dlq/{id}", GetDLQEntryHandler)
+		r.Delete("/webhooks/dlq/{id}", DeleteDLQEntryHandler)
 	})
 
 	return r

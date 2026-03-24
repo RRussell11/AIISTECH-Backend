@@ -24,6 +24,7 @@ const (
 	bucketEvents    = "events"
 	bucketArtifacts = "artifacts"
 	bucketAudit     = "audit"
+	bucketDLQ       = "webhook_dlq"
 )
 
 // HealthzHandler handles GET /healthz (non-site-scoped).
@@ -417,6 +418,102 @@ func ReadyzHandler(reg *site.Registry) http.HandlerFunc {
 // Returns all registered expvar counters as JSON.
 func MetricsHandler(w http.ResponseWriter, r *http.Request) {
 	expvar.Handler().ServeHTTP(w, r)
+}
+
+// --- Webhook DLQ ---
+
+// ListDLQHandler handles GET /sites/{site_id}/webhooks/dlq.
+// Returns paginated keys of failed webhook delivery records stored in the
+// "webhook_dlq" bucket. Supports ?cursor= and ?limit= for cursor-based
+// pagination (ADR-015, Segment 15).
+func ListDLQHandler(w http.ResponseWriter, r *http.Request) {
+	sc, ok := site.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "site context missing", http.StatusInternalServerError)
+		return
+	}
+
+	cursor, limit, ok := parsePaginationParams(w, r)
+	if !ok {
+		return
+	}
+
+	keys, nextCursor, err := sc.Store.ListPage(bucketDLQ, cursor, limit)
+	if err != nil {
+		slog.Error("failed to list DLQ entries", "site_id", sc.SiteID, "error", err)
+		http.Error(w, "failed to list DLQ entries", http.StatusInternalServerError)
+		return
+	}
+	if keys == nil {
+		keys = []string{}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
+		"site_id":     sc.SiteID,
+		"entries":     keys,
+		"next_cursor": nextCursor,
+	})
+}
+
+// GetDLQEntryHandler handles GET /sites/{site_id}/webhooks/dlq/{id}.
+// Returns the raw JSON of a single DLQ record (ADR-015, Segment 15).
+func GetDLQEntryHandler(w http.ResponseWriter, r *http.Request) {
+	sc, ok := site.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "site context missing", http.StatusInternalServerError)
+		return
+	}
+
+	id := chi.URLParam(r, "id")
+	if err := site.Validate(id); err != nil {
+		http.Error(w, fmt.Sprintf("invalid id: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	data, err := sc.Store.Get(bucketDLQ, id)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			http.Error(w, "DLQ entry not found", http.StatusNotFound)
+			return
+		}
+		slog.Error("failed to read DLQ entry", "site_id", sc.SiteID, "key", id, "error", err)
+		http.Error(w, "failed to read DLQ entry", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(data) //nolint:errcheck
+}
+
+// DeleteDLQEntryHandler handles DELETE /sites/{site_id}/webhooks/dlq/{id}.
+// Purges a DLQ entry once the operator has replayed or dismissed it.
+// Protected by AuthMiddleware when an api_key is configured for the site
+// (ADR-015, Segment 15).
+func DeleteDLQEntryHandler(w http.ResponseWriter, r *http.Request) {
+	sc, ok := site.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "site context missing", http.StatusInternalServerError)
+		return
+	}
+
+	id := chi.URLParam(r, "id")
+	if err := site.Validate(id); err != nil {
+		http.Error(w, fmt.Sprintf("invalid id: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	if err := sc.Store.Delete(bucketDLQ, id); err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			http.Error(w, "DLQ entry not found", http.StatusNotFound)
+			return
+		}
+		slog.Error("failed to delete DLQ entry", "site_id", sc.SiteID, "key", id, "error", err)
+		http.Error(w, "failed to delete DLQ entry", http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // --- helpers ---

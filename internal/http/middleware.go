@@ -189,6 +189,7 @@ func AuditMiddleware(d webhooks.Dispatcher) func(http.Handler) http.Handler {
 					ID:        entry.RequestID,
 					Type:      "audit.write",
 					TenantID:  sc.TenantID,
+					SiteID:    sc.SiteID,
 					CreatedAt: time.Now().UTC(),
 					Data:      entry,
 				}

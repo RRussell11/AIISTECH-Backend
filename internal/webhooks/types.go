@@ -22,6 +22,51 @@ package webhooks
 
 import "time"
 
+// DLQSink receives failed webhook delivery records. Implementations must be
+// safe for concurrent use from multiple goroutines.
+//
+// A nil DLQSink is a valid no-op value; callers must guard with a nil check
+// before calling WriteDLQ (see WorkerDispatcher).
+type DLQSink interface {
+	// WriteDLQ persists record for later inspection or replay. Errors are
+	// logged by the caller; they do not affect the delivery retry logic.
+	WriteDLQ(record DLQRecord) error
+}
+
+// DLQRecord captures all information needed to inspect or replay a webhook
+// delivery that exhausted all retry attempts (ADR-015, Segment 15).
+type DLQRecord struct {
+	// EventID is the ID of the originating webhooks.Event.
+	EventID string `json:"event_id"`
+
+	// EventType is the type string of the originating event (e.g. "audit.write").
+	EventType string `json:"event_type"`
+
+	// SiteID is the site that produced the event.
+	SiteID string `json:"site_id,omitempty"`
+
+	// TenantID is the tenant scope, sourced from the originating event.
+	TenantID string `json:"tenant_id,omitempty"`
+
+	// SubscriptionID is the ID of the subscription that could not be delivered.
+	SubscriptionID string `json:"subscription_id"`
+
+	// URL is the subscriber endpoint that rejected or was unreachable.
+	URL string `json:"url"`
+
+	// Payload is the JSON-serialised event body that was attempted.
+	Payload []byte `json:"payload"`
+
+	// AttemptCount is the total number of delivery attempts made.
+	AttemptCount int `json:"attempt_count"`
+
+	// LastError is the string representation of the final delivery error.
+	LastError string `json:"last_error"`
+
+	// FailedAt is the UTC time at which the last attempt was abandoned.
+	FailedAt time.Time `json:"failed_at"`
+}
+
 // Subscription represents a single webhook subscription as returned by the
 // PhaseMirror-HQ daemon subscription API (v1).
 //
@@ -75,6 +120,11 @@ type Event struct {
 	// TenantID is the optional tenant scope for this event, sourced from the
 	// X-Tenant-ID request header. Empty means no tenant scope (default bucket).
 	TenantID string `json:"tenant_id,omitempty"`
+
+	// SiteID is the site that produced the event, sourced from SiteContext.SiteID
+	// by AuditMiddleware. Used by StoreDLQSink to route failed deliveries to the
+	// correct site store (ADR-015, Segment 15).
+	SiteID string `json:"site_id,omitempty"`
 
 	// CreatedAt is the UTC time at which the originating action occurred.
 	CreatedAt time.Time `json:"created_at"`
