@@ -15,6 +15,10 @@ type SiteContext struct {
 	// APIKey is the bearer token required for mutating requests to this site.
 	// Empty means authentication is disabled for the site.
 	APIKey string
+	// TenantID is an optional tenant scoping identifier for the request.
+	// It is typically sourced from the X-Tenant-ID header by SiteMiddleware.
+	// Empty means "no tenant scope" (the default bucket).
+	TenantID string
 }
 
 // NewContext returns a new context with sc attached.
@@ -28,4 +32,3 @@ func FromContext(ctx context.Context) (SiteContext, bool) {
 	sc, ok := ctx.Value(contextKey{}).(SiteContext)
 	return sc, ok
 }
-
