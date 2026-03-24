@@ -72,6 +72,10 @@ type Event struct {
 	// Type is the event type string (e.g. "audit.write").
 	Type string `json:"type"`
 
+	// TenantID is the optional tenant scope for this event, sourced from the
+	// X-Tenant-ID request header. Empty means no tenant scope (default bucket).
+	TenantID string `json:"tenant_id,omitempty"`
+
 	// CreatedAt is the UTC time at which the originating action occurred.
 	CreatedAt time.Time `json:"created_at"`
 

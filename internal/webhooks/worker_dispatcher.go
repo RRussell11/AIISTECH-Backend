@@ -111,7 +111,7 @@ func (d *WorkerDispatcher) process(evt Event) {
 	)
 	defer cancel()
 
-	subs, err := d.provider.ListSubscriptions(ctx, d.cfg.ServiceName, evt.Type, "")
+	subs, err := d.provider.ListSubscriptions(ctx, d.cfg.ServiceName, evt.Type, evt.TenantID)
 	if err != nil {
 		slog.Error("webhooks: failed to list subscriptions",
 			"event_id", evt.ID,

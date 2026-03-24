@@ -23,6 +23,30 @@ func (p *staticProvider) ListSubscriptions(_ context.Context, _, _, _ string) ([
 	return p.subs, nil
 }
 
+// recordingProvider records the arguments passed to ListSubscriptions.
+type recordingProvider struct {
+	mu       sync.Mutex
+	lastArgs struct {
+		service, eventType, tenantID string
+	}
+	subs []webhooks.Subscription
+}
+
+func (p *recordingProvider) ListSubscriptions(_ context.Context, service, eventType, tenantID string) ([]webhooks.Subscription, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.lastArgs.service = service
+	p.lastArgs.eventType = eventType
+	p.lastArgs.tenantID = tenantID
+	return p.subs, nil
+}
+
+func (p *recordingProvider) recorded() (service, eventType, tenantID string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.lastArgs.service, p.lastArgs.eventType, p.lastArgs.tenantID
+}
+
 // noBackoff is a zero-delay RetryBackoff used in tests to avoid real sleeps.
 func noBackoff(_ int) time.Duration { return 0 }
 
@@ -303,5 +327,63 @@ func TestWorkerDispatcher_NoSignatureWhenNoSecret(t *testing.T) {
 
 	if gotSig != "" {
 		t.Errorf("expected no X-Webhook-Signature header when Secret is empty, got %q", gotSig)
+	}
+}
+
+// TestWorkerDispatcher_PassesTenantIDToProvider verifies that the dispatcher
+// forwards the event's TenantID to the provider's ListSubscriptions call.
+func TestWorkerDispatcher_PassesTenantIDToProvider(t *testing.T) {
+	provider := &recordingProvider{
+		subs: []webhooks.Subscription{
+			{ID: "sub-8", URL: "http://localhost", Enabled: false, Events: []string{"audit.write"}},
+		},
+	}
+	d := webhooks.NewWorkerDispatcher(webhooks.Config{
+		ServiceName:    "aiistech-backend",
+		MaxAttempts:    1,
+		WorkerCount:    1,
+		TimeoutSeconds: 5,
+		RetryBackoff:   noBackoff,
+	}, provider)
+
+	evt := webhooks.Event{ID: "evt-8", Type: "audit.write", TenantID: "acme-corp"}
+	if err := d.Dispatch(context.Background(), evt); err != nil {
+		t.Fatalf("Dispatch() error = %v", err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	_, _, tenantID := provider.recorded()
+	if tenantID != "acme-corp" {
+		t.Errorf("ListSubscriptions tenantID = %q, want %q", tenantID, "acme-corp")
+	}
+}
+
+// TestWorkerDispatcher_EmptyTenantIDToProvider verifies that when an event has
+// no TenantID, the provider receives an empty string (default bucket).
+func TestWorkerDispatcher_EmptyTenantIDToProvider(t *testing.T) {
+	provider := &recordingProvider{
+		subs: []webhooks.Subscription{},
+	}
+	d := webhooks.NewWorkerDispatcher(webhooks.Config{
+		ServiceName:    "aiistech-backend",
+		MaxAttempts:    1,
+		WorkerCount:    1,
+		TimeoutSeconds: 5,
+		RetryBackoff:   noBackoff,
+	}, provider)
+
+	evt := webhooks.Event{ID: "evt-9", Type: "audit.write"} // no TenantID
+	if err := d.Dispatch(context.Background(), evt); err != nil {
+		t.Fatalf("Dispatch() error = %v", err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	_, _, tenantID := provider.recorded()
+	if tenantID != "" {
+		t.Errorf("ListSubscriptions tenantID = %q, want empty string for default bucket", tenantID)
 	}
 }

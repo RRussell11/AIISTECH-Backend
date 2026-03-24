@@ -63,7 +63,8 @@ func SiteMiddleware(reg *site.Registry, stores *storage.Registry) func(http.Hand
 				return
 			}
 
-			sc := site.SiteContext{SiteID: siteID, Store: store, APIKey: cfg.APIKey}
+			tenantID := r.Header.Get("X-Tenant-ID")
+			sc := site.SiteContext{SiteID: siteID, Store: store, APIKey: cfg.APIKey, TenantID: tenantID}
 			ctx := site.NewContext(r.Context(), sc)
 			slog.Info("request", "method", r.Method, "path", r.URL.Path, "site_id", siteID)
 			next.ServeHTTP(w, r.WithContext(ctx))
@@ -187,6 +188,7 @@ func AuditMiddleware(d webhooks.Dispatcher) func(http.Handler) http.Handler {
 				evt := webhooks.Event{
 					ID:        entry.RequestID,
 					Type:      "audit.write",
+					TenantID:  sc.TenantID,
 					CreatedAt: time.Now().UTC(),
 					Data:      entry,
 				}

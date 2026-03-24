@@ -1,13 +1,18 @@
 package http_test
 
 import (
+	"bytes"
 	"context"
 	"net/http"
+	"net/http/httptest"
 	"sync"
 	"testing"
 
+	"github.com/go-chi/chi/v5"
+
 	auditpkg "github.com/RRussell11/AIISTECH-Backend/internal/audit"
 	chihttp "github.com/RRussell11/AIISTECH-Backend/internal/http"
+	"github.com/RRussell11/AIISTECH-Backend/internal/site"
 	"github.com/RRussell11/AIISTECH-Backend/internal/storage"
 	"github.com/RRussell11/AIISTECH-Backend/internal/webhooks"
 )
@@ -42,6 +47,83 @@ func newRouterWithDispatcher(t *testing.T, disp webhooks.Dispatcher) http.Handle
 	stores := storage.NewRegistry()
 	t.Cleanup(func() { stores.CloseAll() })
 	return chihttp.NewRouter(makeTestRegistry(t), stores, disp)
+}
+
+// TestSiteMiddleware_TenantID verifies that SiteMiddleware reads the X-Tenant-ID
+// header and attaches it to SiteContext.TenantID in the request context.
+func TestSiteMiddleware_TenantID(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	reg := makeTestRegistry(t)
+	stores := storage.NewRegistry()
+	t.Cleanup(func() { stores.CloseAll() })
+
+	var capturedTenantID string
+	capture := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sc, ok := site.FromContext(r.Context())
+		if !ok {
+			http.Error(w, "no site context", http.StatusInternalServerError)
+			return
+		}
+		capturedTenantID = sc.TenantID
+		w.WriteHeader(http.StatusOK)
+	})
+
+	r := chi.NewRouter()
+	r.Route("/sites/{site_id}", func(r chi.Router) {
+		r.Use(chihttp.SiteMiddleware(reg, stores))
+		r.Get("/healthz", capture)
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/sites/local/healthz", nil)
+	req.Header.Set("X-Tenant-ID", "tenant-abc")
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rr.Code, rr.Body.String())
+	}
+	if capturedTenantID != "tenant-abc" {
+		t.Errorf("SiteContext.TenantID = %q, want %q", capturedTenantID, "tenant-abc")
+	}
+}
+
+// TestSiteMiddleware_TenantIDMissing verifies that a missing X-Tenant-ID header
+// results in an empty TenantID (the default/fallback bucket).
+func TestSiteMiddleware_TenantIDMissing(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	reg := makeTestRegistry(t)
+	stores := storage.NewRegistry()
+	t.Cleanup(func() { stores.CloseAll() })
+
+	var capturedTenantID string
+	capture := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sc, ok := site.FromContext(r.Context())
+		if !ok {
+			http.Error(w, "no site context", http.StatusInternalServerError)
+			return
+		}
+		capturedTenantID = sc.TenantID
+		w.WriteHeader(http.StatusOK)
+	})
+
+	r := chi.NewRouter()
+	r.Route("/sites/{site_id}", func(r chi.Router) {
+		r.Use(chihttp.SiteMiddleware(reg, stores))
+		r.Get("/healthz", capture)
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/sites/local/healthz", nil)
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rr.Code, rr.Body.String())
+	}
+	if capturedTenantID != "" {
+		t.Errorf("SiteContext.TenantID = %q, want empty string for missing header", capturedTenantID)
+	}
 }
 
 // TestAuditMiddleware_DispatchFiredOnPost verifies that a POST request causes
@@ -139,7 +221,57 @@ func TestAuditMiddleware_NoDispatchOnGET(t *testing.T) {
 	}
 }
 
-// TestAuditMiddleware_DeleteDispatchFired verifies that DELETE also triggers dispatch.
+// TestAuditMiddleware_TenantID verifies that AuditMiddleware populates the
+// webhook event's TenantID from the X-Tenant-ID request header via SiteContext.
+func TestAuditMiddleware_TenantID(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	disp := &captureDispatcher{}
+	router := newRouterWithDispatcher(t, disp)
+
+	req, err := http.NewRequest(http.MethodPost, "/sites/local/events", bytes.NewReader([]byte(`{"x":1}`)))
+	if err != nil {
+		t.Fatalf("building request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Tenant-ID", "acme-corp")
+
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body: %s", rr.Code, rr.Body.String())
+	}
+
+	evts := disp.captured()
+	if len(evts) != 1 {
+		t.Fatalf("dispatched %d events, want 1", len(evts))
+	}
+	if evts[0].TenantID != "acme-corp" {
+		t.Errorf("event TenantID = %q, want %q", evts[0].TenantID, "acme-corp")
+	}
+}
+
+// TestAuditMiddleware_TenantIDEmpty verifies that an absent X-Tenant-ID header
+// results in an empty TenantID on the dispatched event.
+func TestAuditMiddleware_TenantIDEmpty(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	disp := &captureDispatcher{}
+	router := newRouterWithDispatcher(t, disp)
+
+	rr := do(t, router, http.MethodPost, "/sites/local/events", []byte(`{"x":1}`))
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body: %s", rr.Code, rr.Body.String())
+	}
+
+	evts := disp.captured()
+	if len(evts) != 1 {
+		t.Fatalf("dispatched %d events, want 1", len(evts))
+	}
+	if evts[0].TenantID != "" {
+		t.Errorf("event TenantID = %q, want empty string for absent header", evts[0].TenantID)
+	}
+}
 func TestAuditMiddleware_DeleteDispatchFired(t *testing.T) {
 	t.Chdir(t.TempDir())
 
