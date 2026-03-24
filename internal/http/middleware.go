@@ -61,6 +61,14 @@ func SiteMiddleware(reg *site.Registry, stores *storage.Registry) func(http.Hand
 				http.Error(w, "failed to open site store", http.StatusInternalServerError)
 				return
 			}
+			tenantID := r.Header.Get("X-Tenant-ID")
+
+sc := site.SiteContext{
+    SiteID:    siteID,
+    Store:     store,
+    APIKey:    cfg.APIKey,
+    TenantID:  tenantID,
+}
 
 			cfg, err := config.Load(siteID, config.ConfigPath(siteID))
 			if err != nil {
