@@ -61,6 +61,7 @@ func main() {
 		provider := webhooks.NewRemoteProvider(webhookBase, os.Getenv("AIISTECH_WEBHOOK_TOKEN"), 0)
 		wd := webhooks.NewWorkerDispatcher(webhooks.Config{
 			ServiceName: serviceName,
+			DLQ:         webhooks.NewStoreDLQSink(stores),
 		}, provider)
 		disp = wd
 		slog.Info("webhook dispatcher started", "service", serviceName, "base_url", webhookBase)
@@ -71,7 +72,7 @@ func main() {
 		addr = v
 	}
 
-	router := sitehttp.NewRouter(reg, stores, disp)
+	router := sitehttp.NewRouter(reg, stores, disp, nil)
 
 	srv := &http.Server{
 		Addr:    addr,

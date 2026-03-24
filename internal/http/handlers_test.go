@@ -3,6 +3,7 @@ package http_test
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -12,6 +13,7 @@ import (
 	chihttp "github.com/RRussell11/AIISTECH-Backend/internal/http"
 	"github.com/RRussell11/AIISTECH-Backend/internal/site"
 	"github.com/RRussell11/AIISTECH-Backend/internal/storage"
+	"github.com/RRussell11/AIISTECH-Backend/internal/webhooks"
 )
 
 // makeTestRegistry returns a Registry loaded from a temp file with local+staging.
@@ -39,7 +41,7 @@ func newRouter(t *testing.T) http.Handler {
 	t.Helper()
 	stores := storage.NewRegistry()
 	t.Cleanup(func() { stores.CloseAll() })
-	return chihttp.NewRouter(makeTestRegistry(t), stores, nil)
+	return chihttp.NewRouter(makeTestRegistry(t), stores, nil, nil)
 }
 
 // do performs an HTTP request against the router and returns the response recorder.
@@ -974,5 +976,315 @@ func TestPagination_ArtifactsAndAuditSupportCursor(t *testing.T) {
 	entries := auditBody["entries"].([]any)
 	if len(entries) != 2 {
 		t.Errorf("audit page len = %d, want 2", len(entries))
+	}
+}
+
+// --- Webhook DLQ ---
+
+// TestListDLQHandler_Empty verifies that listing an empty DLQ returns an empty
+// entries array and no error.
+func TestListDLQHandler_Empty(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	rr := do(t, newRouter(t), http.MethodGet, "/sites/local/webhooks/dlq", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rr.Code, rr.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	entries, ok := body["entries"].([]any)
+	if !ok {
+		t.Fatalf("entries field missing or wrong type")
+	}
+	if len(entries) != 0 {
+		t.Errorf("expected 0 entries, got %d", len(entries))
+	}
+}
+
+// TestDLQHandlers_WriteListGetDelete exercises the full DLQ lifecycle via
+// direct store writes (simulating the dispatcher) and the three HTTP endpoints.
+func TestDLQHandlers_WriteListGetDelete(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	stores := storage.NewRegistry()
+	t.Cleanup(func() { stores.CloseAll() })
+
+	router := chihttp.NewRouter(makeTestRegistry(t), stores, nil, nil)
+
+	// Pre-seed a DLQ record directly into the store (simulates a dispatcher write).
+	store, err := stores.Open("local")
+	if err != nil {
+		t.Fatalf("opening store: %v", err)
+	}
+	const dlqBucket = "webhook_dlq"
+	const entryKey = "1711296000000000000-1.json"
+	payload := []byte(`{"event_id":"evt-x","subscription_id":"sub-x","last_error":"503"}`)
+	if err := store.Write(dlqBucket, entryKey, payload); err != nil {
+		t.Fatalf("seeding DLQ entry: %v", err)
+	}
+
+	// List — should return the one entry.
+	rrList := do(t, router, http.MethodGet, "/sites/local/webhooks/dlq", nil)
+	if rrList.Code != http.StatusOK {
+		t.Fatalf("list status = %d, want 200; body: %s", rrList.Code, rrList.Body.String())
+	}
+	var listBody map[string]any
+	if err := json.Unmarshal(rrList.Body.Bytes(), &listBody); err != nil {
+		t.Fatalf("decode list: %v", err)
+	}
+	entries, _ := listBody["entries"].([]any)
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 entry, got %d: %v", len(entries), entries)
+	}
+	if entries[0].(string) != entryKey {
+		t.Errorf("entry key = %q, want %q", entries[0], entryKey)
+	}
+
+	// Get — should return the raw JSON payload.
+	rrGet := do(t, router, http.MethodGet, "/sites/local/webhooks/dlq/"+entryKey, nil)
+	if rrGet.Code != http.StatusOK {
+		t.Fatalf("get status = %d, want 200; body: %s", rrGet.Code, rrGet.Body.String())
+	}
+	var got map[string]any
+	if err := json.Unmarshal(rrGet.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode get: %v", err)
+	}
+	if got["event_id"] != "evt-x" {
+		t.Errorf("event_id = %v, want %q", got["event_id"], "evt-x")
+	}
+
+	// Delete — should return 204.
+	rrDel := do(t, router, http.MethodDelete, "/sites/local/webhooks/dlq/"+entryKey, nil)
+	if rrDel.Code != http.StatusNoContent {
+		t.Fatalf("delete status = %d, want 204; body: %s", rrDel.Code, rrDel.Body.String())
+	}
+
+	// Get after delete — should return 404.
+	rrAfter := do(t, router, http.MethodGet, "/sites/local/webhooks/dlq/"+entryKey, nil)
+	if rrAfter.Code != http.StatusNotFound {
+		t.Fatalf("get-after-delete status = %d, want 404", rrAfter.Code)
+	}
+
+	// List after delete — should be empty.
+	rrList2 := do(t, router, http.MethodGet, "/sites/local/webhooks/dlq", nil)
+	if rrList2.Code != http.StatusOK {
+		t.Fatalf("list-after-delete status = %d", rrList2.Code)
+	}
+	var listBody2 map[string]any
+	json.Unmarshal(rrList2.Body.Bytes(), &listBody2) //nolint:errcheck
+	entries2, _ := listBody2["entries"].([]any)
+	if len(entries2) != 0 {
+		t.Errorf("expected 0 entries after delete, got %d", len(entries2))
+	}
+}
+
+// TestGetDLQEntryHandler_NotFound verifies that a request for a non-existent
+// DLQ entry returns 404.
+func TestGetDLQEntryHandler_NotFound(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	rr := do(t, newRouter(t), http.MethodGet, "/sites/local/webhooks/dlq/no-such-entry.json", nil)
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404; body: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// TestDeleteDLQEntryHandler_NotFound verifies that deleting a non-existent
+// DLQ entry returns 404.
+func TestDeleteDLQEntryHandler_NotFound(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	rr := do(t, newRouter(t), http.MethodDelete, "/sites/local/webhooks/dlq/no-such-entry.json", nil)
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404; body: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// --- DLQ Replay ---
+
+// newRouterWithReplayClient builds a router wired to a specific HTTP client for
+// the DLQ replay endpoint. Used so replay tests can inject an httptest.Server.
+func newRouterWithReplayClient(t *testing.T, replayClient *http.Client) http.Handler {
+	t.Helper()
+	stores := storage.NewRegistry()
+	t.Cleanup(func() { stores.CloseAll() })
+	return chihttp.NewRouter(makeTestRegistry(t), stores, nil, replayClient)
+}
+
+// TestReplayDLQEntryHandler_Success verifies that a successful replay delivers
+// the payload to the receiver, returns 200, and removes the DLQ entry.
+func TestReplayDLQEntryHandler_Success(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	// Receiver that always returns 200.
+	var receivedBody []byte
+	receiver := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedBody, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer receiver.Close()
+
+	replayClient := receiver.Client()
+	stores := storage.NewRegistry()
+	t.Cleanup(func() { stores.CloseAll() })
+	router := chihttp.NewRouter(makeTestRegistry(t), stores, nil, replayClient)
+
+	// Seed a DLQ record pointing at our test receiver.
+	const dlqBucket = "webhook_dlq"
+	const entryKey = "1000000000000000000-1.json"
+	payload := []byte(`{"id":"evt-replay","type":"audit.write"}`)
+	rec := map[string]any{
+		"event_id": "evt-replay",
+		"url":      receiver.URL,
+		"payload":  payload,
+	}
+	recBytes, _ := json.Marshal(rec)
+	store, err := stores.Open("local")
+	if err != nil {
+		t.Fatalf("opening store: %v", err)
+	}
+	if err := store.Write(dlqBucket, entryKey, recBytes); err != nil {
+		t.Fatalf("seeding DLQ entry: %v", err)
+	}
+
+	// Replay.
+	rr := do(t, router, http.MethodPost, "/sites/local/webhooks/dlq/"+entryKey+"/replay", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rr.Code, rr.Body.String())
+	}
+
+	// Response body should indicate success.
+	var body map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body["status"] != "ok" {
+		t.Errorf("status = %v, want %q", body["status"], "ok")
+	}
+	if body["entry_deleted"] != true {
+		t.Errorf("entry_deleted = %v, want true", body["entry_deleted"])
+	}
+
+	// The receiver must have received the payload.
+	if len(receivedBody) == 0 {
+		t.Error("receiver got no payload")
+	}
+
+	// The DLQ entry must be gone.
+	rrAfter := do(t, router, http.MethodGet, "/sites/local/webhooks/dlq/"+entryKey, nil)
+	if rrAfter.Code != http.StatusNotFound {
+		t.Fatalf("after replay get: status = %d, want 404", rrAfter.Code)
+	}
+}
+
+// TestReplayDLQEntryHandler_ReceiverFailure verifies that a 5xx from the
+// receiver causes a 502 response and the DLQ entry is preserved.
+func TestReplayDLQEntryHandler_ReceiverFailure(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	// Receiver that always returns 503.
+	receiver := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer receiver.Close()
+
+	stores := storage.NewRegistry()
+	t.Cleanup(func() { stores.CloseAll() })
+	router := chihttp.NewRouter(makeTestRegistry(t), stores, nil, receiver.Client())
+
+	const dlqBucket = "webhook_dlq"
+	const entryKey = "2000000000000000000-1.json"
+	rec := map[string]any{
+		"event_id": "evt-fail",
+		"url":      receiver.URL,
+		"payload":  []byte(`{"id":"evt-fail"}`),
+	}
+	recBytes, _ := json.Marshal(rec)
+	store, err := stores.Open("local")
+	if err != nil {
+		t.Fatalf("opening store: %v", err)
+	}
+	if err := store.Write(dlqBucket, entryKey, recBytes); err != nil {
+		t.Fatalf("seeding DLQ entry: %v", err)
+	}
+
+	rr := do(t, router, http.MethodPost, "/sites/local/webhooks/dlq/"+entryKey+"/replay", nil)
+	if rr.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502; body: %s", rr.Code, rr.Body.String())
+	}
+
+	// DLQ entry must still exist.
+	rrGet := do(t, router, http.MethodGet, "/sites/local/webhooks/dlq/"+entryKey, nil)
+	if rrGet.Code != http.StatusOK {
+		t.Fatalf("entry should still exist after failed replay, got %d", rrGet.Code)
+	}
+}
+
+// TestReplayDLQEntryHandler_NotFound verifies that replaying a non-existent
+// DLQ entry returns 404.
+func TestReplayDLQEntryHandler_NotFound(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	router := newRouterWithReplayClient(t, nil)
+	rr := do(t, router, http.MethodPost, "/sites/local/webhooks/dlq/no-such.json/replay", nil)
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404; body: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// TestReplayDLQEntryHandler_SignatureHeader verifies that when a DLQ record
+// has a Secret, the replay POST includes X-Webhook-Signature and
+// X-Webhook-Timestamp headers.
+func TestReplayDLQEntryHandler_SignatureHeader(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	const secret = "replay-secret"
+	var gotSig, gotTS string
+	receiver := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotSig = r.Header.Get("X-Webhook-Signature")
+		gotTS = r.Header.Get("X-Webhook-Timestamp")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer receiver.Close()
+
+	stores := storage.NewRegistry()
+	t.Cleanup(func() { stores.CloseAll() })
+	router := chihttp.NewRouter(makeTestRegistry(t), stores, nil, receiver.Client())
+
+	const dlqBucket = "webhook_dlq"
+	const entryKey = "3000000000000000000-1.json"
+	payload := []byte(`{"id":"evt-sig"}`)
+	rec := map[string]any{
+		"event_id": "evt-sig",
+		"url":      receiver.URL,
+		"secret":   secret,
+		"payload":  payload,
+	}
+	recBytes, _ := json.Marshal(rec)
+	store, err := stores.Open("local")
+	if err != nil {
+		t.Fatalf("opening store: %v", err)
+	}
+	if err := store.Write(dlqBucket, entryKey, recBytes); err != nil {
+		t.Fatalf("seeding DLQ entry: %v", err)
+	}
+
+	rr := do(t, router, http.MethodPost, "/sites/local/webhooks/dlq/"+entryKey+"/replay", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rr.Code, rr.Body.String())
+	}
+
+	if gotSig == "" {
+		t.Error("expected X-Webhook-Signature header, got none")
+	}
+	if gotTS == "" {
+		t.Error("expected X-Webhook-Timestamp header, got none")
+	}
+	// Verify the signature matches what webhooks.SignatureHeader would compute.
+	wantSig := webhooks.SignatureHeader(secret, gotTS, payload)
+	if gotSig != wantSig {
+		t.Errorf("X-Webhook-Signature = %q, want %q", gotSig, wantSig)
 	}
 }

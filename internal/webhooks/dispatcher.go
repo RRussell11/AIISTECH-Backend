@@ -65,4 +65,10 @@ type Config struct {
 	// exponential back-off (1 s, 2 s, 4 s … capped at 30 s).
 	// Override in tests to avoid real sleeps.
 	RetryBackoff func(attempt int) time.Duration
+
+	// DLQ is an optional sink for failed deliveries. When non-nil, any
+	// delivery that exhausts all retry attempts writes a DLQRecord to the
+	// sink instead of being silently dropped. If nil, failed deliveries are
+	// only logged (ADR-015, Segment 15).
+	DLQ DLQSink
 }

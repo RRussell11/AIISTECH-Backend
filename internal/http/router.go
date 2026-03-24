@@ -2,6 +2,7 @@ package http
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -14,7 +15,13 @@ import (
 // NewRouter builds and returns the application HTTP router.
 // disp may be nil; when non-nil it receives an "audit.write" webhook event
 // for every state-mutating request processed by AuditMiddleware.
-func NewRouter(reg *site.Registry, stores *storage.Registry, disp webhooks.Dispatcher) http.Handler {
+// replayClient is the HTTP client used by the DLQ replay endpoint; when nil a
+// default client with a 10-second timeout is used (ADR-016, Segment 16).
+func NewRouter(reg *site.Registry, stores *storage.Registry, disp webhooks.Dispatcher, replayClient *http.Client) http.Handler {
+	if replayClient == nil {
+		replayClient = &http.Client{Timeout: 10 * time.Second}
+	}
+
 	r := chi.NewRouter()
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.RequestID) // injects X-Request-Id for audit traceability
@@ -44,6 +51,10 @@ func NewRouter(reg *site.Registry, stores *storage.Registry, disp webhooks.Dispa
 		r.Delete("/artifacts/{filename}", DeleteArtifactHandler)
 		r.Get("/audit", ListAuditHandler)
 		r.Get("/audit/{filename}", GetAuditHandler)
+		r.Get("/webhooks/dlq", ListDLQHandler)
+		r.Get("/webhooks/dlq/{id}", GetDLQEntryHandler)
+		r.Delete("/webhooks/dlq/{id}", DeleteDLQEntryHandler)
+		r.Post("/webhooks/dlq/{id}/replay", ReplayDLQEntryHandler(replayClient))
 	})
 
 	return r
