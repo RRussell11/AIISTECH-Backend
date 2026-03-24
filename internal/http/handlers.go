@@ -18,6 +18,7 @@ import (
 	"github.com/RRussell11/AIISTECH-Backend/internal/site"
 	"github.com/RRussell11/AIISTECH-Backend/internal/state"
 	"github.com/RRussell11/AIISTECH-Backend/internal/storage"
+	"github.com/RRussell11/AIISTECH-Backend/internal/version"
 )
 
 const (
@@ -57,6 +58,10 @@ func PostEventHandler(w http.ResponseWriter, r *http.Request) {
 
 	body, key, err := readJSONBody(r)
 	if err != nil {
+		if errors.Is(err, errBodyTooLarge) {
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -188,6 +193,10 @@ func PostArtifactHandler(w http.ResponseWriter, r *http.Request) {
 
 	body, key, err := readJSONBody(r)
 	if err != nil {
+		if errors.Is(err, errBodyTooLarge) {
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -421,12 +430,22 @@ func MetricsHandler(w http.ResponseWriter, r *http.Request) {
 
 // --- helpers ---
 
-// readJSONBody reads and validates a JSON request body (max 1 MiB).
+// errBodyTooLarge is returned by readJSONBody when the request body exceeds
+// the configured maximum size (set by MaxBodyMiddleware).
+var errBodyTooLarge = errors.New("request body too large")
+
+// readJSONBody reads and validates a JSON request body.
 // It returns the raw bytes and a nanosecond-timestamped storage key.
+// When the body exceeds the middleware-enforced limit (MaxBodyMiddleware) it
+// returns errBodyTooLarge so handlers can respond with 413.
 func readJSONBody(r *http.Request) (body []byte, key string, err error) {
 	raw, readErr := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	defer r.Body.Close()
 	if readErr != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(readErr, &maxErr) {
+			return nil, "", errBodyTooLarge
+		}
 		return nil, "", fmt.Errorf("failed to read request body")
 	}
 	if !json.Valid(raw) {
@@ -538,6 +557,17 @@ func keyMatchesFilter(key string, f listFilter) bool {
 	}
 
 	return true
+}
+
+// VersionHandler handles GET /version.
+// Returns build-time metadata set via -ldflags at build time.
+func VersionHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{ //nolint:errcheck
+		"version":    version.Version,
+		"commit":     version.Commit,
+		"build_time": version.BuildTime,
+	})
 }
 
 // listFilteredPage applies Segment 11 filtering BEFORE pagination.

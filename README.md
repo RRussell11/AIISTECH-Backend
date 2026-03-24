@@ -21,6 +21,10 @@ All stateful operations are scoped by an explicit `site_id`.
   - [Segment 7 — Persistent Storage](#segment-7--persistent-storage)
   - [Segment 8 — Authentication & Authorisation](#segment-8--authentication--authorisation)
   - [Segment 9 — Pagination](#segment-9--pagination)
+  - [Segment 10 — Docker & CI/CD](#segment-10--docker--cicd)
+  - [Segment 11A — Ops Hardening](#segment-11a--ops-hardening)
+  - [Segment 11B — List Filtering](#segment-11b--list-filtering)
+  - [Segment 11C — Webhook Subscription Caching](#segment-11c--webhook-subscription-caching)
 - [Roadmap](#roadmap)
 - [Tests](#tests)
 
@@ -53,6 +57,15 @@ The server reads the site registry from `contracts/shared/sites.yaml` on startup
 | `AIISTECH_ADDR` | `:8080` | Listen address |
 | `AIISTECH_REGISTRY_PATH` | `contracts/shared/sites.yaml` | Path to site registry file |
 | `AIISTECH_LOG_LEVEL` | `INFO` | Structured log verbosity (`DEBUG`, `INFO`, `WARN`, `ERROR`) |
+| `AIISTECH_CORS_ALLOW_ORIGINS` | *(disabled)* | Comma-separated list of allowed CORS origins (e.g. `https://app.example.com,https://admin.example.com`). When unset, CORS headers are not written. Use `*` to allow all origins. |
+| `AIISTECH_MAX_BODY_BYTES` | `1048576` | Maximum request body size in bytes for mutating requests (POST/PUT/PATCH/DELETE). Requests exceeding this limit receive `413 Request Entity Too Large`. |
+| `AIISTECH_RATE_LIMIT_RPS` | `10` | Sustained rate limit (requests per second) applied per-IP to mutating requests. Requests exceeding the burst receive `429 Too Many Requests`. |
+| `AIISTECH_RATE_LIMIT_BURST` | `20` | Maximum burst size for the per-IP rate limiter. |
+| `AIISTECH_WEBHOOK_BASE_URL` | *(disabled)* | PhaseMirror-HQ subscription API base URL. When set, audit events are dispatched as webhooks. |
+| `AIISTECH_WEBHOOK_TOKEN` | *(none)* | Bearer token for the webhook subscription API. |
+| `AIISTECH_SERVICE_NAME` | `aiistech-backend` | Logical service name used when registering with PhaseMirror-HQ. |
+| `AIISTECH_WEBHOOK_CACHE_TTL_SECONDS` | `30` | TTL (seconds) for the per-`(service, eventType, tenantID)` subscription cache. Reduces load on the PhaseMirror-HQ API when many events fire in quick succession. |
+| `AIISTECH_WEBHOOK_POLL_INTERVAL_SECONDS` | `0` (disabled) | Background subscription poll interval in seconds. When positive, a goroutine proactively refreshes all known cache keys at this interval, keeping the cache warm so dispatch never blocks on an HTTP fetch. `0` disables background polling (lazy-only mode). |
 
 ## Project Structure
 
@@ -446,6 +459,197 @@ Triggers on every push and pull-request to any branch. Three sequential steps mu
 | Vet | `go vet ./...` |
 | Test | `go test ./...` |
 | Build | `go build ./cmd/server` |
+
+---
+
+### Segment 11A — Ops Hardening
+
+Segment 11A adds production-grade operational middleware and server hardening.
+
+#### CORS
+
+CORS is **disabled by default**. Set `AIISTECH_CORS_ALLOW_ORIGINS` to a comma-separated list of allowed origins to enable it.
+
+```bash
+# Allow a specific origin
+AIISTECH_CORS_ALLOW_ORIGINS=https://app.example.com go run ./cmd/server
+
+# Allow all origins (development only)
+AIISTECH_CORS_ALLOW_ORIGINS='*' go run ./cmd/server
+```
+
+`OPTIONS` preflight requests return `204 No Content` when the origin matches.
+
+#### Max Request Body Size
+
+Mutating requests (POST/PUT/PATCH/DELETE) are limited to `AIISTECH_MAX_BODY_BYTES` (default `1048576` = 1 MiB). Requests exceeding the limit receive:
+
+```json
+HTTP/1.1 413 Request Entity Too Large
+request body too large
+```
+
+#### Per-IP Rate Limiting
+
+Mutating requests are rate-limited per source IP. The rate limiter uses a token-bucket algorithm:
+
+| Env var | Default | Description |
+|---|---|---|
+| `AIISTECH_RATE_LIMIT_RPS` | `10` | Sustained token replenishment rate (requests/second) |
+| `AIISTECH_RATE_LIMIT_BURST` | `20` | Maximum burst (tokens available at start) |
+
+Requests that exceed the burst receive:
+
+```json
+HTTP/1.1 429 Too Many Requests
+{"error":"rate limit exceeded"}
+```
+
+GET/HEAD/OPTIONS requests are **not** rate-limited.
+
+#### HTTP Server Timeouts
+
+The server is configured with safe timeouts to prevent slow-client attacks:
+
+| Timeout | Value |
+|---|---|
+| `ReadHeaderTimeout` | 5 s |
+| `ReadTimeout` | 10 s |
+| `WriteTimeout` | 30 s |
+| `IdleTimeout` | 120 s |
+
+#### `GET /version`
+
+Returns build metadata set via `-ldflags` at build time.
+
+```bash
+curl http://localhost:8080/version
+# {"build_time":"2024-06-01T12:00:00Z","commit":"abc1234","version":"v1.2.3"}
+```
+
+**Building with version info:**
+
+```bash
+go build \
+  -ldflags "-X github.com/RRussell11/AIISTECH-Backend/internal/version.Version=v1.2.3 \
+            -X github.com/RRussell11/AIISTECH-Backend/internal/version.Commit=$(git rev-parse --short HEAD) \
+            -X github.com/RRussell11/AIISTECH-Backend/internal/version.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  ./cmd/server
+```
+
+Fields default to empty strings when built without the flags.
+
+---
+
+### Segment 11B — List Filtering
+
+All three list endpoints (`/events`, `/artifacts`, `/audit`) support additional query parameters for server-side filtering. Filters are applied _before_ pagination, so `limit` and `next_cursor` always reflect the filtered result set.
+
+**Filter query parameters:**
+
+| Parameter | Type | Description |
+|---|---|---|
+| `since_ns` | int (nanoseconds) | Return only keys with a nanosecond timestamp ≥ this value. |
+| `until_ns` | int (nanoseconds) | Return only keys with a nanosecond timestamp ≤ this value. |
+| `prefix` | string | Return only keys whose filename starts with this string. |
+| `contains` | string | Return only keys whose filename contains this string. |
+
+All parameters are optional and combinable. Keys that do not parse as `<nanosecond>.json` are excluded when `since_ns` or `until_ns` is provided.
+
+**Example — events written in the last hour:**
+
+```bash
+since=$(( ($(date +%s) - 3600) * 1000000000 ))
+curl "http://localhost:8080/sites/local/events?since_ns=${since}"
+# {"events":["...nanosecond....json"],"next_cursor":"","site_id":"local"}
+```
+
+**Example — first 10 artifacts whose filename contains "build":**
+
+```bash
+curl "http://localhost:8080/sites/local/artifacts?contains=build&limit=10"
+```
+
+**Error responses:**
+
+| Condition | Status |
+|---|---|
+| `since_ns` or `until_ns` is not a non-negative integer | `400 Bad Request` |
+| `since_ns` > `until_ns` | `400 Bad Request` |
+
+---
+
+### Segment 11C — Webhook Subscription Caching
+
+When `AIISTECH_WEBHOOK_BASE_URL` is set, the webhook dispatcher fetches active subscriptions from PhaseMirror-HQ before each delivery. Without caching this produces one HTTP round-trip to the subscription API _per event per worker_. Under sustained load (e.g. many rapid deploys) this would hit the upstream API harder than necessary.
+
+Segment 11C wraps `RemoteProvider` in a `CachingProvider` that retains subscription lists in memory for a configurable TTL. Subsequent events within the TTL window read from the cache without calling the API.
+
+**Behaviour:**
+
+- Cache key: `(service, eventType, tenantID)` — distinct event types are cached independently.
+- TTL: controlled by `AIISTECH_WEBHOOK_CACHE_TTL_SECONDS` (default **30 s**).
+- Errors from the upstream API are **not** cached; the next event will retry immediately.
+- Eviction is lazy (on the next read after expiry); no background goroutine is added.
+- The implementation is safe for concurrent use by all dispatcher workers.
+
+**Example — reduce cache TTL for high-churn environments:**
+
+```bash
+AIISTECH_WEBHOOK_CACHE_TTL_SECONDS=10 go run ./cmd/server
+```
+
+**Example — disable effective caching (cache for 1 second) for debugging:**
+
+```bash
+AIISTECH_WEBHOOK_CACHE_TTL_SECONDS=1 go run ./cmd/server
+```
+
+---
+
+### Segment 13 — Background Subscription Polling
+
+`CachingProvider` (Segment 11C) uses lazy eviction: subscriptions are re-fetched
+only after a cache entry expires and the next event dispatch triggers a miss.
+Under sustained event bursts this produces brief dispatch-path latency spikes
+every TTL interval, and multiple concurrent workers can all miss simultaneously.
+
+Segment 13 adds two complementary improvements to `CachingProvider`:
+
+1. **Background polling goroutine** — proactively re-fetches every known cache
+   key on a configurable interval so the dispatch hot path is always a cache hit
+   once warmed. Runs only when `AIISTECH_WEBHOOK_POLL_INTERVAL_SECONDS > 0` and
+   is stopped cleanly on shutdown via `CachingProvider.Close()`.
+
+2. **Singleflight coalescing** — concurrent cache misses for the same
+   `(service, eventType, tenantID)` key are deduplicated with
+   `golang.org/x/sync/singleflight`: even at cold start, at most **one** outbound
+   call is made to PhaseMirror-HQ per key regardless of how many goroutines race
+   simultaneously. This eliminates the thundering-herd effect on TTL expiry.
+
+**Behaviour:**
+
+- Background goroutine starts at construction time when `pollInterval > 0`;
+  zero means lazy-only (Segment 11C behaviour, the default).
+- Only keys that have been seen at least once (populated on a first lazy miss)
+  are refreshed by the poller.
+- On a poll error the existing valid cache entry is **preserved** and the error
+  is logged at WARN; a transient HQ outage does not disrupt active dispatch.
+- `Close()` on `CachingProvider` signals the goroutine to stop and blocks until
+  it exits. In `main.go` this runs before `Dispatcher.Close()` to ensure no
+  in-flight deliveries encounter a torn-down provider.
+
+**Example — enable background polling every 20 seconds:**
+
+```bash
+AIISTECH_WEBHOOK_POLL_INTERVAL_SECONDS=20 go run ./cmd/server
+```
+
+**Example — polling with a longer TTL (cache acts as a fallback, not a gate):**
+
+```bash
+AIISTECH_WEBHOOK_CACHE_TTL_SECONDS=120 AIISTECH_WEBHOOK_POLL_INTERVAL_SECONDS=60 go run ./cmd/server
+```
 
 ---
 
