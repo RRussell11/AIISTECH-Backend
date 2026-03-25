@@ -25,6 +25,7 @@ func NewRouter(reg *site.Registry, stores *storage.Registry, disp webhooks.Dispa
 	r := chi.NewRouter()
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.RequestID)               // injects X-Request-Id for audit traceability
+	r.Use(TraceMiddleware)                    // enriches context with trace_id logger; emits access log
 	r.Use(MetricsMiddleware)                  // global request counter
 	r.Use(CORSMiddleware(cfg.CORSOrigins))    // CORS headers + pre-flight; no-op when CORSOrigins is ""
 	r.Use(MaxBodyMiddleware(cfg.MaxBodyBytes)) // body size cap; no-op when MaxBodyBytes <= 0

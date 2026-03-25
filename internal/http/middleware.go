@@ -254,6 +254,45 @@ func MetricsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// loggerKey is the unexported context key used to store the request-scoped
+// *slog.Logger injected by TraceMiddleware.
+type loggerKey struct{}
+
+// LoggerFromContext returns the request-scoped *slog.Logger stored by
+// TraceMiddleware. It falls back to slog.Default() when no logger has been
+// stored in the context (e.g. unit tests that bypass the middleware chain).
+func LoggerFromContext(ctx context.Context) *slog.Logger {
+	if l, ok := ctx.Value(loggerKey{}).(*slog.Logger); ok {
+		return l
+	}
+	return slog.Default()
+}
+
+// TraceMiddleware enriches every request with a request-scoped *slog.Logger
+// that carries the X-Request-Id (injected by chi's RequestID middleware) as a
+// "trace_id" field. The logger is stored in the request context and can be
+// retrieved via LoggerFromContext. When the handler returns, a single
+// structured log line is emitted containing "method", "path", "status", and
+// "latency_ms" alongside the trace_id.
+func TraceMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		traceID := chimiddleware.GetReqID(r.Context())
+		logger := slog.Default().With("trace_id", traceID)
+		ctx := context.WithValue(r.Context(), loggerKey{}, logger)
+
+		sr := newStatusRecorder(w)
+		next.ServeHTTP(sr, r.WithContext(ctx))
+
+		logger.Info("request",
+			"method", r.Method,
+			"path", r.URL.Path,
+			"status", sr.status,
+			"latency_ms", time.Since(start).Milliseconds(),
+		)
+	})
+}
+
 // OpsConfig holds optional operational settings for the router.
 // Zero values disable the corresponding middleware.
 type OpsConfig struct {

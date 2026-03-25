@@ -3,6 +3,7 @@ package http_test
 import (
 	"bytes"
 	"context"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -489,5 +490,58 @@ func TestRateLimit_DifferentIPsNotThrottled(t *testing.T) {
 		if rr.Code != http.StatusOK {
 			t.Errorf("IP %s: status = %d, want 200 (first request should pass)", ip, rr.Code)
 		}
+	}
+}
+
+// ---- TraceMiddleware / LoggerFromContext tests ----
+
+// TestTraceMiddleware_LoggerStoredInContext verifies that a request-scoped
+// *slog.Logger enriched with trace_id is retrievable via LoggerFromContext
+// inside the handler, and that it is a distinct instance from slog.Default().
+func TestTraceMiddleware_LoggerStoredInContext(t *testing.T) {
+	var capturedLogger *slog.Logger
+
+	handler := chihttp.TraceMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedLogger = chihttp.LoggerFromContext(r.Context())
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	if capturedLogger == nil {
+		t.Fatal("expected a non-nil logger in context, got nil")
+	}
+	// .With() returns a fresh *slog.Logger, so the pointer must differ from Default().
+	if capturedLogger == slog.Default() {
+		t.Error("expected an enriched logger (not slog.Default()) to be stored in context")
+	}
+}
+
+// TestTraceMiddleware_StatusCaptured verifies that the access-log line is
+// emitted (no panic) and the downstream handler still receives the correct
+// ResponseWriter (status 201 propagates correctly).
+func TestTraceMiddleware_StatusCaptured(t *testing.T) {
+	handler := chihttp.TraceMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/items", nil)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusCreated {
+		t.Errorf("response status = %d, want 201", rr.Code)
+	}
+}
+
+// TestLoggerFromContext_FallbackToDefault verifies that LoggerFromContext
+// returns slog.Default() when called with a plain context that has no stored
+// logger (e.g. in unit tests that bypass the middleware chain).
+func TestLoggerFromContext_FallbackToDefault(t *testing.T) {
+	l := chihttp.LoggerFromContext(context.Background())
+	if l != slog.Default() {
+		t.Error("expected slog.Default() as fallback when no logger is in context")
 	}
 }
