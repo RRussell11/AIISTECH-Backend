@@ -305,3 +305,127 @@ func TestWorkerDispatcher_NoSignatureWhenNoSecret(t *testing.T) {
 		t.Errorf("expected no X-Webhook-Signature header when Secret is empty, got %q", gotSig)
 	}
 }
+
+// captureDLQ is a test-only DLQSink that records every stored DLQRecord.
+type captureDLQ struct {
+	records []webhooks.DLQRecord
+}
+
+func (c *captureDLQ) Store(r webhooks.DLQRecord) error {
+	c.records = append(c.records, r)
+	return nil
+}
+
+func TestWorkerDispatcher_DLQOnExhaustedRetries(t *testing.T) {
+	// All deliveries fail; with DLQ configured the record should be stored.
+	receiver := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer receiver.Close()
+
+	dlq := &captureDLQ{}
+
+	provider := &staticProvider{subs: []webhooks.Subscription{
+		{
+			ID:      "sub-dlq",
+			URL:     receiver.URL,
+			Enabled: true,
+			Secret:  "test-secret",
+			Events:  []string{"audit.write"},
+		},
+	}}
+	d := webhooks.NewWorkerDispatcher(webhooks.Config{
+		ServiceName:    "aiistech-backend",
+		MaxAttempts:    2,
+		WorkerCount:    1,
+		TimeoutSeconds: 5,
+		RetryBackoff:   noBackoff,
+		DLQ:            dlq,
+	}, provider)
+
+	evt := webhooks.Event{
+		ID:     "evt-dlq",
+		SiteID: "local",
+		Type:   "audit.write",
+	}
+	if err := d.Dispatch(context.Background(), evt); err != nil {
+		t.Fatalf("Dispatch() error = %v", err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	if len(dlq.records) != 1 {
+		t.Fatalf("DLQ got %d records, want 1", len(dlq.records))
+	}
+	r := dlq.records[0]
+	if r.EventID != evt.ID {
+		t.Errorf("DLQ record EventID = %q, want %q", r.EventID, evt.ID)
+	}
+	if r.SiteID != evt.SiteID {
+		t.Errorf("DLQ record SiteID = %q, want %q", r.SiteID, evt.SiteID)
+	}
+	if r.SubscriptionID != "sub-dlq" {
+		t.Errorf("DLQ record SubscriptionID = %q, want %q", r.SubscriptionID, "sub-dlq")
+	}
+	if r.Secret != "test-secret" {
+		t.Errorf("DLQ record Secret = %q, want %q", r.Secret, "test-secret")
+	}
+	if r.Attempts != 2 {
+		t.Errorf("DLQ record Attempts = %d, want 2", r.Attempts)
+	}
+	if r.FailedAt.IsZero() {
+		t.Error("DLQ record FailedAt must not be zero")
+	}
+	if len(r.Payload) == 0 {
+		t.Error("DLQ record Payload must not be empty")
+	}
+}
+
+func TestWorkerDispatcher_NoDLQWhenNilConfig(t *testing.T) {
+	// No DLQ set; exhausted retries should not panic.
+	receiver := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer receiver.Close()
+
+	provider := &staticProvider{subs: []webhooks.Subscription{
+		{ID: "sub-nodlq", URL: receiver.URL, Enabled: true, Events: []string{"audit.write"}},
+	}}
+	d := webhooks.NewWorkerDispatcher(webhooks.Config{
+		MaxAttempts:  1,
+		WorkerCount:  1,
+		RetryBackoff: noBackoff,
+		DLQ:          nil, // explicitly nil
+	}, provider)
+
+	_ = d.Dispatch(context.Background(), webhooks.Event{ID: "evt-nodlq", Type: "audit.write"})
+	_ = d.Close()
+	// If we got here without panicking the test passes.
+}
+
+func TestWorkerDispatcher_DLQNotCalledOnSuccess(t *testing.T) {
+	// Successful delivery must NOT write to the DLQ.
+	receiver := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer receiver.Close()
+
+	dlq := &captureDLQ{}
+	provider := &staticProvider{subs: []webhooks.Subscription{
+		{ID: "sub-ok", URL: receiver.URL, Enabled: true, Events: []string{"audit.write"}},
+	}}
+	d := webhooks.NewWorkerDispatcher(webhooks.Config{
+		MaxAttempts:  3,
+		WorkerCount:  1,
+		RetryBackoff: noBackoff,
+		DLQ:          dlq,
+	}, provider)
+
+	_ = d.Dispatch(context.Background(), webhooks.Event{ID: "evt-ok", Type: "audit.write"})
+	_ = d.Close()
+
+	if len(dlq.records) != 0 {
+		t.Errorf("DLQ got %d records on successful delivery, want 0", len(dlq.records))
+	}
+}

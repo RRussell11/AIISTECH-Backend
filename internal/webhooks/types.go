@@ -69,6 +69,11 @@ type Event struct {
 	// nanosecond-timestamped key matching the originating audit entry).
 	ID string `json:"id"`
 
+	// SiteID identifies the site that originated the event. Used by the
+	// Dead Letter Queue sink to route failed deliveries to the correct
+	// site-scoped store.
+	SiteID string `json:"site_id,omitempty"`
+
 	// TenantID is the tenant that originated the event. Empty when the site
 	// operates in legacy (non-tenant) mode.
 	TenantID string `json:"tenant_id,omitempty"`

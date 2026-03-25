@@ -1,6 +1,7 @@
 package http
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"expvar"
@@ -19,12 +20,14 @@ import (
 	"github.com/RRussell11/AIISTECH-Backend/internal/state"
 	"github.com/RRussell11/AIISTECH-Backend/internal/storage"
 	"github.com/RRussell11/AIISTECH-Backend/internal/version"
+	"github.com/RRussell11/AIISTECH-Backend/internal/webhooks"
 )
 
 const (
 	bucketEvents    = "events"
 	bucketArtifacts = "artifacts"
 	bucketAudit     = "audit"
+	bucketDLQ       = webhooks.DLQBucket
 )
 
 // HealthzHandler handles GET /healthz (non-site-scoped).
@@ -467,6 +470,186 @@ func ReadyzHandler(reg *site.Registry) http.HandlerFunc {
 // Returns all registered expvar counters as JSON.
 func MetricsHandler(w http.ResponseWriter, r *http.Request) {
 	expvar.Handler().ServeHTTP(w, r)
+}
+
+// --- DLQ handlers ---
+
+// ListDLQHandler handles GET /sites/{site_id}/webhooks/dlq.
+// Returns a paginated JSON array of DLQ entries for the current site.
+func ListDLQHandler(w http.ResponseWriter, r *http.Request) {
+	sc, ok := site.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "site context missing", http.StatusInternalServerError)
+		return
+	}
+	cursor, limit, ok := parsePaginationParams(w, r)
+	if !ok {
+		return
+	}
+
+	keys, nextCursor, err := sc.Store.ListPage(bucketDLQ, cursor, limit)
+	if err != nil {
+		slog.Error("dlq: list failed", "site_id", sc.SiteID, "error", err)
+		http.Error(w, "failed to list DLQ entries", http.StatusInternalServerError)
+		return
+	}
+
+	entries := make([]webhooks.DLQRecord, 0, len(keys))
+	for _, key := range keys {
+		raw, err := sc.Store.Get(bucketDLQ, key)
+		if err != nil {
+			slog.Warn("dlq: get during list failed", "site_id", sc.SiteID, "key", key, "error", err)
+			continue
+		}
+		var rec webhooks.DLQRecord
+		if err := json.Unmarshal(raw, &rec); err != nil {
+			slog.Warn("dlq: unmarshal during list failed", "site_id", sc.SiteID, "key", key, "error", err)
+			continue
+		}
+		entries = append(entries, rec)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	resp := map[string]any{
+		"entries":     entries,
+		"next_cursor": nextCursor,
+	}
+	json.NewEncoder(w).Encode(resp) //nolint:errcheck
+}
+
+// GetDLQHandler handles GET /sites/{site_id}/webhooks/dlq/{id}.
+// Returns a single DLQ entry.
+func GetDLQHandler(w http.ResponseWriter, r *http.Request) {
+	sc, ok := site.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "site context missing", http.StatusInternalServerError)
+		return
+	}
+	id := chi.URLParam(r, "id")
+
+	raw, err := sc.Store.Get(bucketDLQ, id)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			http.Error(w, "DLQ entry not found", http.StatusNotFound)
+			return
+		}
+		slog.Error("dlq: get failed", "site_id", sc.SiteID, "id", id, "error", err)
+		http.Error(w, "failed to get DLQ entry", http.StatusInternalServerError)
+		return
+	}
+
+	var rec webhooks.DLQRecord
+	if err := json.Unmarshal(raw, &rec); err != nil {
+		slog.Error("dlq: unmarshal failed", "site_id", sc.SiteID, "id", id, "error", err)
+		http.Error(w, "failed to decode DLQ entry", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(rec) //nolint:errcheck
+}
+
+// DeleteDLQHandler handles DELETE /sites/{site_id}/webhooks/dlq/{id}.
+// Removes a single DLQ entry permanently.
+func DeleteDLQHandler(w http.ResponseWriter, r *http.Request) {
+	sc, ok := site.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "site context missing", http.StatusInternalServerError)
+		return
+	}
+	id := chi.URLParam(r, "id")
+
+	if err := sc.Store.Delete(bucketDLQ, id); err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			http.Error(w, "DLQ entry not found", http.StatusNotFound)
+			return
+		}
+		slog.Error("dlq: delete failed", "site_id", sc.SiteID, "id", id, "error", err)
+		http.Error(w, "failed to delete DLQ entry", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"status": "ok", "deleted": id}) //nolint:errcheck
+}
+
+// ReplayDLQHandler returns an HTTP handler that replays a DLQ entry.
+// It re-POSTs the stored payload to the original subscription URL, re-computing
+// the HMAC signature when the record has a Secret. On a 2xx response the entry
+// is deleted and 200 {"status":"ok","entry_deleted":true} is returned. On any
+// delivery failure the entry is preserved and 502 is returned.
+func ReplayDLQHandler(client *http.Client) http.HandlerFunc {
+	if client == nil {
+		client = &http.Client{Timeout: 10 * time.Second}
+	}
+	return func(w http.ResponseWriter, r *http.Request) {
+		sc, ok := site.FromContext(r.Context())
+		if !ok {
+			http.Error(w, "site context missing", http.StatusInternalServerError)
+			return
+		}
+		id := chi.URLParam(r, "id")
+
+		raw, err := sc.Store.Get(bucketDLQ, id)
+		if err != nil {
+			if errors.Is(err, storage.ErrNotFound) {
+				http.Error(w, "DLQ entry not found", http.StatusNotFound)
+				return
+			}
+			slog.Error("dlq: replay get failed", "site_id", sc.SiteID, "id", id, "error", err)
+			http.Error(w, "failed to get DLQ entry", http.StatusInternalServerError)
+			return
+		}
+
+		var rec webhooks.DLQRecord
+		if err := json.Unmarshal(raw, &rec); err != nil {
+			slog.Error("dlq: replay unmarshal failed", "site_id", sc.SiteID, "id", id, "error", err)
+			http.Error(w, "failed to decode DLQ entry", http.StatusInternalServerError)
+			return
+		}
+
+		// Build replay request with fresh timestamp and optional HMAC signature.
+		timestamp := fmt.Sprintf("%d", time.Now().Unix())
+		req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, rec.SubscriptionURL, bytes.NewReader(rec.Payload))
+		if err != nil {
+			slog.Error("dlq: building replay request failed", "site_id", sc.SiteID, "id", id, "error", err)
+			http.Error(w, "failed to build replay request", http.StatusInternalServerError)
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Webhook-Timestamp", timestamp)
+		if rec.Secret != "" {
+			req.Header.Set("X-Webhook-Signature",
+				webhooks.SignatureHeader(rec.Secret, timestamp, rec.Payload))
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			slog.Warn("dlq: replay delivery failed", "site_id", sc.SiteID, "id", id, "url", rec.SubscriptionURL, "error", err)
+			http.Error(w, "replay delivery failed: "+err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer func() { _ = resp.Body.Close() }()
+
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			slog.Warn("dlq: replay receiver returned non-2xx",
+				"site_id", sc.SiteID, "id", id,
+				"url", rec.SubscriptionURL, "status", resp.StatusCode)
+			http.Error(w, fmt.Sprintf("receiver returned %d", resp.StatusCode), http.StatusBadGateway)
+			return
+		}
+
+		// Delivery succeeded — remove the entry.
+		if err := sc.Store.Delete(bucketDLQ, id); err != nil && !errors.Is(err, storage.ErrNotFound) {
+			slog.Error("dlq: delete after replay failed", "site_id", sc.SiteID, "id", id, "error", err)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
+			"status":        "ok",
+			"entry_deleted": true,
+		})
+	}
 }
 
 // --- helpers ---

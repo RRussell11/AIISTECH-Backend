@@ -227,6 +227,7 @@ func AuditMiddleware(d webhooks.Dispatcher) func(http.Handler) http.Handler {
 			if d != nil {
 				evt := webhooks.Event{
 					ID:        entry.RequestID,
+					SiteID:    sc.SiteID,
 					TenantID:  sc.TenantID,
 					Type:      "audit.write",
 					CreatedAt: time.Now().UTC(),
@@ -272,6 +273,16 @@ type OpsConfig struct {
 	// RateLimitBurst is the token-bucket burst allowance. Values ≤ 0 default to
 	// max(1, int(RateLimitRPS)).
 	RateLimitBurst int
+
+	// DLQ is the dead-letter queue sink used by the router's DLQ HTTP handlers.
+	// When non-nil, the GET/DELETE/POST-replay endpoints for
+	// /sites/{site_id}/webhooks/dlq are registered.
+	DLQ webhooks.DLQSink
+
+	// ReplayClient is the HTTP client used by the DLQ replay handler to re-POST
+	// failed webhook payloads. When nil, a default client with a 10 s timeout
+	// is used. Ignored when DLQ is nil.
+	ReplayClient *http.Client
 }
 
 // CORSMiddleware adds CORS headers to every response and handles pre-flight

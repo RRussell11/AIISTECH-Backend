@@ -134,7 +134,7 @@ func (d *WorkerDispatcher) process(evt Event) {
 		if !matchesEventType(sub, evt.Type) {
 			continue
 		}
-		d.deliverWithRetry(sub, evt.ID, bodyBytes)
+		d.deliverWithRetry(sub, evt, bodyBytes)
 	}
 }
 
@@ -154,13 +154,14 @@ func matchesEventType(sub Subscription, eventType string) bool {
 
 // deliverWithRetry attempts to POST bodyBytes to sub.URL up to MaxAttempts
 // times, sleeping cfg.RetryBackoff(attempt) between failures.
-func (d *WorkerDispatcher) deliverWithRetry(sub Subscription, eventID string, bodyBytes []byte) {
+// If all attempts are exhausted and cfg.DLQ is set, a DLQRecord is stored.
+func (d *WorkerDispatcher) deliverWithRetry(sub Subscription, evt Event, bodyBytes []byte) {
 	var lastErr error
 	for attempt := 1; attempt <= d.cfg.MaxAttempts; attempt++ {
 		if err := d.deliverOnce(sub, bodyBytes); err == nil {
 			slog.Info("webhooks: delivered",
 				"subscription_id", sub.ID,
-				"event_id", eventID,
+				"event_id", evt.ID,
 				"attempt", attempt,
 			)
 			return
@@ -172,7 +173,7 @@ func (d *WorkerDispatcher) deliverWithRetry(sub Subscription, eventID string, bo
 			backoff := d.cfg.RetryBackoff(attempt)
 			slog.Warn("webhooks: delivery failed, retrying",
 				"subscription_id", sub.ID,
-				"event_id", eventID,
+				"event_id", evt.ID,
 				"attempt", attempt,
 				"backoff", backoff,
 				"error", lastErr,
@@ -182,10 +183,33 @@ func (d *WorkerDispatcher) deliverWithRetry(sub Subscription, eventID string, bo
 	}
 	slog.Error("webhooks: delivery abandoned after max attempts",
 		"subscription_id", sub.ID,
-		"event_id", eventID,
+		"event_id", evt.ID,
 		"max_attempts", d.cfg.MaxAttempts,
 		"error", lastErr,
 	)
+
+	// Move to DLQ when configured.
+	if d.cfg.DLQ != nil {
+		record := DLQRecord{
+			SubscriptionID:  sub.ID,
+			SubscriptionURL: sub.URL,
+			Secret:          sub.Secret,
+			EventID:         evt.ID,
+			EventType:       evt.Type,
+			SiteID:          evt.SiteID,
+			TenantID:        evt.TenantID,
+			Payload:         bodyBytes,
+			Attempts:        d.cfg.MaxAttempts,
+			FailedAt:        time.Now().UTC(),
+		}
+		if err := d.cfg.DLQ.Store(record); err != nil {
+			slog.Error("webhooks: failed to store DLQ record",
+				"subscription_id", sub.ID,
+				"event_id", evt.ID,
+				"error", err,
+			)
+		}
+	}
 }
 
 // deliverOnce performs a single HTTP POST of bodyBytes to sub.URL.

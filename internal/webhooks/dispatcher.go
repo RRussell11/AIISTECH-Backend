@@ -65,4 +65,10 @@ type Config struct {
 	// exponential back-off (1 s, 2 s, 4 s … capped at 30 s).
 	// Override in tests to avoid real sleeps.
 	RetryBackoff func(attempt int) time.Duration
+
+	// DLQ is an optional dead-letter queue sink. When non-nil, the dispatcher
+	// calls DLQ.Store for every subscription delivery that exhausts all retry
+	// attempts without receiving a 2xx response. A nil DLQ silently discards
+	// such failures (existing behaviour).
+	DLQ DLQSink
 }

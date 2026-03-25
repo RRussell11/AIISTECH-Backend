@@ -49,6 +49,10 @@ func main() {
 
 	stores := storage.NewRegistry()
 
+	// DLQ sink — always created so that the webhook DLQ HTTP endpoints work
+	// regardless of whether the outbound webhook dispatcher is configured.
+	dlqSink := webhooks.NewStoreDLQSink(stores)
+
 	// Webhook dispatcher — optional. Configure via env vars:
 	//   AIISTECH_WEBHOOK_BASE_URL             — PhaseMirror-HQ subscriptions base URL
 	//   AIISTECH_WEBHOOK_TOKEN                — bearer token for subscription API (optional)
@@ -94,9 +98,10 @@ func main() {
 
 		wd := webhooks.NewWorkerDispatcher(webhooks.Config{
 			ServiceName: serviceName,
+			DLQ:         dlqSink, // failed deliveries go to per-site webhook_dlq bucket
 		}, provider)
 		disp = wd
-		slog.Info("webhook dispatcher started", "service", serviceName, "base_url", webhookBase)
+		slog.Info("webhook dispatcher started with DLQ", "service", serviceName, "base_url", webhookBase)
 	}
 
 	addr := defaultAddr
@@ -111,6 +116,9 @@ func main() {
 	//   AIISTECH_RATE_LIMIT_BURST   — token-bucket burst (defaults to max(1,RPS))
 	ops := sitehttp.OpsConfig{
 		CORSOrigins: os.Getenv("AIISTECH_CORS_ALLOW_ORIGINS"),
+		// DLQ sink — wired unconditionally so that the GET/DELETE/replay endpoints
+		// work even without a webhook dispatcher configured.
+		DLQ: dlqSink,
 	}
 	if v := os.Getenv("AIISTECH_MAX_BODY_BYTES"); v != "" {
 		if n, err := strconv.ParseInt(v, 10, 64); err != nil || n <= 0 {

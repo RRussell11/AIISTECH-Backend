@@ -55,6 +55,13 @@ func NewRouter(reg *site.Registry, stores *storage.Registry, disp webhooks.Dispa
 		r.Delete("/artifacts/{filename}", DeleteArtifactHandler)
 		r.Get("/audit", ListAuditHandler)
 		r.Get("/audit/{filename}", GetAuditHandler)
+
+		// Webhook DLQ — registered unconditionally; returns empty results when
+		// no failed deliveries have been stored for this site.
+		r.Get("/webhooks/dlq", ListDLQHandler)
+		r.Get("/webhooks/dlq/{id}", GetDLQHandler)
+		r.Delete("/webhooks/dlq/{id}", DeleteDLQHandler)
+		r.Post("/webhooks/dlq/{id}/replay", ReplayDLQHandler(cfg.ReplayClient))
 	})
 
 	return r
