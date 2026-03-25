@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"expvar"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -20,8 +21,20 @@ const (
 
 	// subscriptionFetchTimeoutMultiplier scales the per-delivery timeout up for
 	// the subscription-listing call, which must complete before any delivery
-	// can begin and therefore benefits from a slightly longer budget.
+	// can begin and therefore benefits from a slightly longer budget. The listing
+	// is scoped by service name, event type, and tenant ID.
 	subscriptionFetchTimeoutMultiplier = 2
+)
+
+var (
+	// metricsWebhookDeliveriesTotal counts successful webhook deliveries.
+	metricsWebhookDeliveriesTotal = expvar.NewInt("webhook_deliveries_total")
+	// metricsWebhookDeliveryFailuresTotal counts delivery attempts abandoned after
+	// all retries are exhausted (one increment per subscription that could not
+	// be reached, regardless of whether the event went to the DLQ).
+	metricsWebhookDeliveryFailuresTotal = expvar.NewInt("webhook_delivery_failures_total")
+	// metricsWebhookDLQStoredTotal counts records successfully stored in the DLQ.
+	metricsWebhookDLQStoredTotal = expvar.NewInt("webhook_dlq_stored_total")
 )
 
 // WorkerDispatcher is the concrete Dispatcher implementation. It maintains an
@@ -35,6 +48,7 @@ type WorkerDispatcher struct {
 	jobs     chan dispatchJob
 	wg       sync.WaitGroup
 	client   *http.Client
+	breakers *breakerRegistry // nil when circuit breaking is disabled
 }
 
 // dispatchJob is an internal unit of work placed on the queue by Dispatch.
@@ -61,12 +75,18 @@ func NewWorkerDispatcher(cfg Config, provider Provider) *WorkerDispatcher {
 		cfg.RetryBackoff = exponentialBackoff
 	}
 
+	var breakers *breakerRegistry
+	if cfg.CircuitBreaker != nil {
+		breakers = newBreakerRegistry(*cfg.CircuitBreaker)
+	}
+
 	d := &WorkerDispatcher{
 		cfg:      cfg,
 		provider: provider,
 		// Buffer 4× the worker count before Dispatch starts blocking callers.
-		jobs:   make(chan dispatchJob, cfg.WorkerCount*4),
-		client: &http.Client{Timeout: time.Duration(cfg.TimeoutSeconds) * time.Second},
+		jobs:     make(chan dispatchJob, cfg.WorkerCount*4),
+		client:   &http.Client{Timeout: time.Duration(cfg.TimeoutSeconds) * time.Second},
+		breakers: breakers,
 	}
 	for range cfg.WorkerCount {
 		d.wg.Add(1)
@@ -111,7 +131,18 @@ func (d *WorkerDispatcher) process(evt Event) {
 	)
 	defer cancel()
 
-	subs, err := d.provider.ListSubscriptions(ctx, d.cfg.ServiceName, evt.Type, "")
+	// Thread the originating site ID so that store-backed providers can route
+	// to the correct per-site bbolt store (StoreRegistryProvider, ADR-036).
+	if evt.SiteID != "" {
+		ctx = WithSiteID(ctx, evt.SiteID)
+	}
+
+	slog.Debug("webhooks: fetching subscriptions",
+		"event_id", evt.ID,
+		"event_type", evt.Type,
+		"site_id", evt.SiteID,
+	)
+	subs, err := d.provider.ListSubscriptions(ctx, d.cfg.ServiceName, evt.Type, evt.TenantID)
 	if err != nil {
 		slog.Error("webhooks: failed to list subscriptions",
 			"event_id", evt.ID,
@@ -134,7 +165,7 @@ func (d *WorkerDispatcher) process(evt Event) {
 		if !matchesEventType(sub, evt.Type) {
 			continue
 		}
-		d.deliverWithRetry(sub, evt.ID, bodyBytes)
+		d.deliverWithRetry(sub, evt, bodyBytes)
 	}
 }
 
@@ -154,15 +185,39 @@ func matchesEventType(sub Subscription, eventType string) bool {
 
 // deliverWithRetry attempts to POST bodyBytes to sub.URL up to MaxAttempts
 // times, sleeping cfg.RetryBackoff(attempt) between failures.
-func (d *WorkerDispatcher) deliverWithRetry(sub Subscription, eventID string, bodyBytes []byte) {
+// When circuit breaking is enabled (cfg.CircuitBreaker != nil) and the
+// breaker for sub is Open, the delivery is fast-failed without any HTTP
+// attempts.
+// If all attempts are exhausted (or the circuit is open) and cfg.DLQ is set,
+// a DLQRecord is stored.
+func (d *WorkerDispatcher) deliverWithRetry(sub Subscription, evt Event, bodyBytes []byte) {
+	// --- Circuit breaker check ---
+	if d.breakers != nil {
+		cb := d.breakers.get(sub.ID)
+		if !cb.Allow() {
+			slog.Warn("webhooks: circuit open, skipping delivery",
+				"subscription_id", sub.ID,
+				"event_id", evt.ID,
+			)
+			metricsWebhookDeliveryFailuresTotal.Add(1)
+			d.storeDLQ(sub, evt, bodyBytes, 0)
+			return
+		}
+	}
+
+	// --- Retry loop ---
 	var lastErr error
 	for attempt := 1; attempt <= d.cfg.MaxAttempts; attempt++ {
 		if err := d.deliverOnce(sub, bodyBytes); err == nil {
 			slog.Info("webhooks: delivered",
 				"subscription_id", sub.ID,
-				"event_id", eventID,
+				"event_id", evt.ID,
 				"attempt", attempt,
 			)
+			metricsWebhookDeliveriesTotal.Add(1)
+			if d.breakers != nil {
+				d.breakers.get(sub.ID).RecordSuccess()
+			}
 			return
 		} else {
 			lastErr = err
@@ -172,7 +227,7 @@ func (d *WorkerDispatcher) deliverWithRetry(sub Subscription, eventID string, bo
 			backoff := d.cfg.RetryBackoff(attempt)
 			slog.Warn("webhooks: delivery failed, retrying",
 				"subscription_id", sub.ID,
-				"event_id", eventID,
+				"event_id", evt.ID,
 				"attempt", attempt,
 				"backoff", backoff,
 				"error", lastErr,
@@ -180,12 +235,48 @@ func (d *WorkerDispatcher) deliverWithRetry(sub Subscription, eventID string, bo
 			time.Sleep(backoff)
 		}
 	}
+
+	// --- All retries exhausted ---
 	slog.Error("webhooks: delivery abandoned after max attempts",
 		"subscription_id", sub.ID,
-		"event_id", eventID,
+		"event_id", evt.ID,
 		"max_attempts", d.cfg.MaxAttempts,
 		"error", lastErr,
 	)
+	metricsWebhookDeliveryFailuresTotal.Add(1)
+	if d.breakers != nil {
+		d.breakers.get(sub.ID).RecordFailure()
+	}
+	d.storeDLQ(sub, evt, bodyBytes, d.cfg.MaxAttempts)
+}
+
+// storeDLQ writes a DLQRecord for sub/evt when a DLQ sink is configured.
+// attempts is the number of delivery attempts made (0 = circuit-open fast-fail).
+func (d *WorkerDispatcher) storeDLQ(sub Subscription, evt Event, bodyBytes []byte, attempts int) {
+	if d.cfg.DLQ == nil {
+		return
+	}
+	record := DLQRecord{
+		SubscriptionID:  sub.ID,
+		SubscriptionURL: sub.URL,
+		Secret:          sub.Secret,
+		EventID:         evt.ID,
+		EventType:       evt.Type,
+		SiteID:          evt.SiteID,
+		TenantID:        evt.TenantID,
+		Payload:         bodyBytes,
+		Attempts:        attempts,
+		FailedAt:        time.Now().UTC(),
+	}
+	if err := d.cfg.DLQ.Store(record); err != nil {
+		slog.Error("webhooks: failed to store DLQ record",
+			"subscription_id", sub.ID,
+			"event_id", evt.ID,
+			"error", err,
+		)
+	} else {
+		metricsWebhookDLQStoredTotal.Add(1)
+	}
 }
 
 // deliverOnce performs a single HTTP POST of bodyBytes to sub.URL.

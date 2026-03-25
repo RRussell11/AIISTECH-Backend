@@ -1,6 +1,7 @@
 package http
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"expvar"
@@ -18,18 +19,46 @@ import (
 	"github.com/RRussell11/AIISTECH-Backend/internal/site"
 	"github.com/RRussell11/AIISTECH-Backend/internal/state"
 	"github.com/RRussell11/AIISTECH-Backend/internal/storage"
+	"github.com/RRussell11/AIISTECH-Backend/internal/version"
+	"github.com/RRussell11/AIISTECH-Backend/internal/webhooks"
 )
 
 const (
 	bucketEvents    = "events"
 	bucketArtifacts = "artifacts"
 	bucketAudit     = "audit"
+	bucketDLQ       = webhooks.DLQBucket
+)
+
+// serverStartTime records when the package was first loaded (effectively
+// process start). It is used by LivezHandler to report process uptime.
+// Setting this at package init rather than explicit server-start wiring is
+// intentional: the difference is sub-second for typical deployments and keeps
+// the implementation zero-configuration.
+var serverStartTime = time.Now()
+
+var (
+	// metricsEventsWrittenBySite counts successful event writes per site ID.
+	metricsEventsWrittenBySite = expvar.NewMap("events_written_by_site")
+	// metricsArtifactsWrittenBySite counts successful artifact writes per site ID.
+	metricsArtifactsWrittenBySite = expvar.NewMap("artifacts_written_by_site")
 )
 
 // HealthzHandler handles GET /healthz (non-site-scoped).
 func HealthzHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"}) //nolint:errcheck
+}
+
+// VersionHandler handles GET /version (non-site-scoped).
+// It returns the build-time version metadata injected via -ldflags.
+func VersionHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{ //nolint:errcheck
+		"version":    version.Version,
+		"commit":     version.Commit,
+		"build_time": version.BuildTime,
+	})
 }
 
 // SiteHealthzHandler handles GET /sites/{site_id}/healthz (site-scoped).
@@ -61,13 +90,31 @@ func PostEventHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := sc.Store.Write(bucketEvents, key, body); err != nil {
-		slog.Error("failed to write event", "site_id", sc.SiteID, "key", key, "error", err)
+	// Schema validation: check required fields when event_schema is configured.
+	if sc.Config.EventSchema != nil && len(sc.Config.EventSchema.Required) > 0 {
+		if missing := validateJSONFields(body, sc.Config.EventSchema.Required); len(missing) > 0 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
+				"error":          "schema validation failed",
+				"missing_fields": missing,
+			})
+			return
+		}
+	}
+
+	// storageKey is the full tenant-namespaced key used in the store.
+	// key (bare) is returned to the client so it can be used in subsequent GET requests.
+	storageKey := tenantKey(sc.TenantID, key)
+
+	if err := sc.Store.Write(bucketEvents, storageKey, body); err != nil {
+		slog.Error("failed to write event", "site_id", sc.SiteID, "key", storageKey, "error", err)
 		http.Error(w, "failed to write event", http.StatusInternalServerError)
 		return
 	}
+	metricsEventsWrittenBySite.Add(sc.SiteID, 1)
 
-	slog.Info("event written", "site_id", sc.SiteID, "key", key)
+	slog.Info("event written", "site_id", sc.SiteID, "key", storageKey)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
@@ -100,12 +147,14 @@ func ListEventsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	cursor, filter, tenantPrefix := applyTenantFilter(sc.TenantID, cursor, filter)
 	keys, nextCursor, err := listFilteredPage(sc.Store, bucketEvents, cursor, limit, filter)
 	if err != nil {
 		slog.Error("failed to list events", "site_id", sc.SiteID, "error", err)
 		http.Error(w, "failed to list events", http.StatusInternalServerError)
 		return
 	}
+	keys, nextCursor = stripTenantPrefix(tenantPrefix, keys, nextCursor)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
@@ -130,7 +179,7 @@ func GetEventHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	data, err := sc.Store.Get(bucketEvents, filename)
+	data, err := sc.Store.Get(bucketEvents, tenantKey(sc.TenantID, filename))
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			http.Error(w, "event not found", http.StatusNotFound)
@@ -145,15 +194,44 @@ func GetEventHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write(data) //nolint:errcheck
 }
 
+// DeleteEventHandler handles DELETE /sites/{site_id}/events/{filename}.
+// Returns 204 No Content on success, 404 when the event does not exist.
+func DeleteEventHandler(w http.ResponseWriter, r *http.Request) {
+	sc, ok := site.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "site context missing", http.StatusInternalServerError)
+		return
+	}
+
+	filename := chi.URLParam(r, "filename")
+	if err := site.Validate(filename); err != nil {
+		http.Error(w, fmt.Sprintf("invalid filename: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	if err := sc.Store.Delete(bucketEvents, tenantKey(sc.TenantID, filename)); err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			http.Error(w, "event not found", http.StatusNotFound)
+			return
+		}
+		slog.Error("failed to delete event", "site_id", sc.SiteID, "key", filename, "error", err)
+		http.Error(w, "failed to delete event", http.StatusInternalServerError)
+		return
+	}
+
+	slog.Info("event deleted", "site_id", sc.SiteID, "key", filename)
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // ListSitesHandler handles GET /sites (non-site-scoped).
 // Returns the full catalog of registered sites and the default site.
-func ListSitesHandler(reg *site.Registry) http.HandlerFunc {
+func ListSitesHandler(reg *site.AtomicRegistry) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ids := reg.SiteIDs()
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
-			"default_site_id": reg.DefaultSiteID,
+			"default_site_id": reg.DefaultSiteID(),
 			"sites":           ids,
 		})
 	}
@@ -192,13 +270,29 @@ func PostArtifactHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := sc.Store.Write(bucketArtifacts, key, body); err != nil {
-		slog.Error("failed to write artifact", "site_id", sc.SiteID, "key", key, "error", err)
+	// Schema validation: check required fields when artifact_schema is configured.
+	if sc.Config.ArtifactSchema != nil && len(sc.Config.ArtifactSchema.Required) > 0 {
+		if missing := validateJSONFields(body, sc.Config.ArtifactSchema.Required); len(missing) > 0 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
+				"error":          "schema validation failed",
+				"missing_fields": missing,
+			})
+			return
+		}
+	}
+
+	storageKey := tenantKey(sc.TenantID, key)
+
+	if err := sc.Store.Write(bucketArtifacts, storageKey, body); err != nil {
+		slog.Error("failed to write artifact", "site_id", sc.SiteID, "key", storageKey, "error", err)
 		http.Error(w, "failed to write artifact", http.StatusInternalServerError)
 		return
 	}
+	metricsArtifactsWrittenBySite.Add(sc.SiteID, 1)
 
-	slog.Info("artifact written", "site_id", sc.SiteID, "key", key)
+	slog.Info("artifact written", "site_id", sc.SiteID, "key", storageKey)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
@@ -229,12 +323,14 @@ func ListArtifactsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	cursor, filter, tenantPrefix := applyTenantFilter(sc.TenantID, cursor, filter)
 	keys, nextCursor, err := listFilteredPage(sc.Store, bucketArtifacts, cursor, limit, filter)
 	if err != nil {
 		slog.Error("failed to list artifacts", "site_id", sc.SiteID, "error", err)
 		http.Error(w, "failed to list artifacts", http.StatusInternalServerError)
 		return
 	}
+	keys, nextCursor = stripTenantPrefix(tenantPrefix, keys, nextCursor)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
@@ -258,7 +354,7 @@ func GetArtifactHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	data, err := sc.Store.Get(bucketArtifacts, filename)
+	data, err := sc.Store.Get(bucketArtifacts, tenantKey(sc.TenantID, filename))
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			http.Error(w, "artifact not found", http.StatusNotFound)
@@ -287,7 +383,7 @@ func DeleteArtifactHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := sc.Store.Delete(bucketArtifacts, filename); err != nil {
+	if err := sc.Store.Delete(bucketArtifacts, tenantKey(sc.TenantID, filename)); err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			http.Error(w, "artifact not found", http.StatusNotFound)
 			return
@@ -323,12 +419,14 @@ func ListAuditHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	cursor, filter, tenantPrefix := applyTenantFilter(sc.TenantID, cursor, filter)
 	keys, nextCursor, err := listFilteredPage(sc.Store, bucketAudit, cursor, limit, filter)
 	if err != nil {
 		slog.Error("failed to list audit entries", "site_id", sc.SiteID, "error", err)
 		http.Error(w, "failed to list audit entries", http.StatusInternalServerError)
 		return
 	}
+	keys, nextCursor = stripTenantPrefix(tenantPrefix, keys, nextCursor)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
@@ -353,7 +451,7 @@ func GetAuditHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	data, err := sc.Store.Get(bucketAudit, filename)
+	data, err := sc.Store.Get(bucketAudit, tenantKey(sc.TenantID, filename))
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			http.Error(w, "audit entry not found", http.StatusNotFound)
@@ -394,21 +492,53 @@ func GetConfigHandler(w http.ResponseWriter, r *http.Request) {
 // --- Observability ---
 
 // LivezHandler handles GET /healthz/live.
-// Returns 200 OK as long as the process is running.
+// Returns 200 OK as long as the process is running, with the process uptime
+// in seconds since the package was first loaded.
 func LivezHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok"}) //nolint:errcheck
+	json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
+		"status":         "ok",
+		"uptime_seconds": int(time.Since(serverStartTime).Seconds()),
+	})
 }
 
 // ReadyzHandler handles GET /healthz/ready.
-// Returns 200 OK when the site registry is loaded and non-empty.
-func ReadyzHandler(reg *site.Registry) http.HandlerFunc {
+// Returns 200 OK when the site registry is non-empty and every registered
+// site's storage can be opened. Returns 503 Service Unavailable when one or
+// more site stores are inaccessible, along with a per-site status map so that
+// operators can pinpoint which stores are degraded.
+func ReadyzHandler(reg *site.AtomicRegistry, stores *storage.Registry) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ids := reg.SiteIDs()
+
+		storeStatus := make(map[string]string, len(ids))
+		allOK := true
+		for _, id := range ids {
+			// stores.Open is idempotent: the Registry caches the open handle and
+			// returns it on subsequent calls, so probing does not open extra file
+			// descriptors. A non-nil error means the underlying bbolt file is
+			// inaccessible (bad path, wrong permissions, corrupt file, etc.).
+			if _, err := stores.Open(id); err != nil {
+				storeStatus[id] = "error: " + err.Error()
+				allOK = false
+			} else {
+				storeStatus[id] = "ok"
+			}
+		}
+
+		statusStr := "ok"
+		code := http.StatusOK
+		if !allOK {
+			statusStr = "degraded"
+			code = http.StatusServiceUnavailable
+		}
+
 		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(code)
 		json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
-			"status": "ok",
+			"status": statusStr,
 			"sites":  len(ids),
+			"stores": storeStatus,
 		})
 	}
 }
@@ -417,6 +547,407 @@ func ReadyzHandler(reg *site.Registry) http.HandlerFunc {
 // Returns all registered expvar counters as JSON.
 func MetricsHandler(w http.ResponseWriter, r *http.Request) {
 	expvar.Handler().ServeHTTP(w, r)
+}
+
+// --- DLQ handlers ---
+
+// ListDLQHandler handles GET /sites/{site_id}/webhooks/dlq.
+// Returns a paginated JSON array of DLQ entries for the current site.
+func ListDLQHandler(w http.ResponseWriter, r *http.Request) {
+	sc, ok := site.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "site context missing", http.StatusInternalServerError)
+		return
+	}
+	cursor, limit, ok := parsePaginationParams(w, r)
+	if !ok {
+		return
+	}
+
+	keys, nextCursor, err := sc.Store.ListPage(bucketDLQ, cursor, limit)
+	if err != nil {
+		slog.Error("dlq: list failed", "site_id", sc.SiteID, "error", err)
+		http.Error(w, "failed to list DLQ entries", http.StatusInternalServerError)
+		return
+	}
+
+	entries := make([]webhooks.DLQRecord, 0, len(keys))
+	for _, key := range keys {
+		raw, err := sc.Store.Get(bucketDLQ, key)
+		if err != nil {
+			slog.Warn("dlq: get during list failed", "site_id", sc.SiteID, "key", key, "error", err)
+			continue
+		}
+		var rec webhooks.DLQRecord
+		if err := json.Unmarshal(raw, &rec); err != nil {
+			slog.Warn("dlq: unmarshal during list failed", "site_id", sc.SiteID, "key", key, "error", err)
+			continue
+		}
+		entries = append(entries, rec)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	resp := map[string]any{
+		"entries":     entries,
+		"next_cursor": nextCursor,
+	}
+	json.NewEncoder(w).Encode(resp) //nolint:errcheck
+}
+
+// GetDLQHandler handles GET /sites/{site_id}/webhooks/dlq/{id}.
+// Returns a single DLQ entry.
+func GetDLQHandler(w http.ResponseWriter, r *http.Request) {
+	sc, ok := site.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "site context missing", http.StatusInternalServerError)
+		return
+	}
+	id := chi.URLParam(r, "id")
+
+	raw, err := sc.Store.Get(bucketDLQ, id)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			http.Error(w, "DLQ entry not found", http.StatusNotFound)
+			return
+		}
+		slog.Error("dlq: get failed", "site_id", sc.SiteID, "id", id, "error", err)
+		http.Error(w, "failed to get DLQ entry", http.StatusInternalServerError)
+		return
+	}
+
+	var rec webhooks.DLQRecord
+	if err := json.Unmarshal(raw, &rec); err != nil {
+		slog.Error("dlq: unmarshal failed", "site_id", sc.SiteID, "id", id, "error", err)
+		http.Error(w, "failed to decode DLQ entry", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(rec) //nolint:errcheck
+}
+
+// DeleteDLQHandler handles DELETE /sites/{site_id}/webhooks/dlq/{id}.
+// Removes a single DLQ entry permanently.
+func DeleteDLQHandler(w http.ResponseWriter, r *http.Request) {
+	sc, ok := site.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "site context missing", http.StatusInternalServerError)
+		return
+	}
+	id := chi.URLParam(r, "id")
+
+	if err := sc.Store.Delete(bucketDLQ, id); err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			http.Error(w, "DLQ entry not found", http.StatusNotFound)
+			return
+		}
+		slog.Error("dlq: delete failed", "site_id", sc.SiteID, "id", id, "error", err)
+		http.Error(w, "failed to delete DLQ entry", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"status": "ok", "deleted": id}) //nolint:errcheck
+}
+
+// ReplayDLQHandler returns an HTTP handler that replays a DLQ entry.
+// It re-POSTs the stored payload to the original subscription URL, re-computing
+// the HMAC signature when the record has a Secret. On a 2xx response the entry
+// is deleted and 200 {"status":"ok","entry_deleted":true} is returned. On any
+// delivery failure the entry is preserved and 502 is returned.
+func ReplayDLQHandler(client *http.Client) http.HandlerFunc {
+	if client == nil {
+		client = &http.Client{Timeout: 10 * time.Second}
+	}
+	return func(w http.ResponseWriter, r *http.Request) {
+		sc, ok := site.FromContext(r.Context())
+		if !ok {
+			http.Error(w, "site context missing", http.StatusInternalServerError)
+			return
+		}
+		id := chi.URLParam(r, "id")
+
+		raw, err := sc.Store.Get(bucketDLQ, id)
+		if err != nil {
+			if errors.Is(err, storage.ErrNotFound) {
+				http.Error(w, "DLQ entry not found", http.StatusNotFound)
+				return
+			}
+			slog.Error("dlq: replay get failed", "site_id", sc.SiteID, "id", id, "error", err)
+			http.Error(w, "failed to get DLQ entry", http.StatusInternalServerError)
+			return
+		}
+
+		var rec webhooks.DLQRecord
+		if err := json.Unmarshal(raw, &rec); err != nil {
+			slog.Error("dlq: replay unmarshal failed", "site_id", sc.SiteID, "id", id, "error", err)
+			http.Error(w, "failed to decode DLQ entry", http.StatusInternalServerError)
+			return
+		}
+
+		// Build replay request with fresh timestamp and optional HMAC signature.
+		timestamp := fmt.Sprintf("%d", time.Now().Unix())
+		req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, rec.SubscriptionURL, bytes.NewReader(rec.Payload))
+		if err != nil {
+			slog.Error("dlq: building replay request failed", "site_id", sc.SiteID, "id", id, "error", err)
+			http.Error(w, "failed to build replay request", http.StatusInternalServerError)
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Webhook-Timestamp", timestamp)
+		if rec.Secret != "" {
+			req.Header.Set("X-Webhook-Signature",
+				webhooks.SignatureHeader(rec.Secret, timestamp, rec.Payload))
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			slog.Warn("dlq: replay delivery failed", "site_id", sc.SiteID, "id", id, "url", rec.SubscriptionURL, "error", err)
+			http.Error(w, "replay delivery failed: "+err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer func() { _ = resp.Body.Close() }()
+
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			slog.Warn("dlq: replay receiver returned non-2xx",
+				"site_id", sc.SiteID, "id", id,
+				"url", rec.SubscriptionURL, "status", resp.StatusCode)
+			http.Error(w, fmt.Sprintf("receiver returned %d", resp.StatusCode), http.StatusBadGateway)
+			return
+		}
+
+		// Delivery succeeded — remove the entry.
+		if err := sc.Store.Delete(bucketDLQ, id); err != nil && !errors.Is(err, storage.ErrNotFound) {
+			slog.Error("dlq: delete after replay failed", "site_id", sc.SiteID, "id", id, "error", err)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
+			"status":        "ok",
+			"entry_deleted": true,
+		})
+	}
+}
+
+// --- Subscription management handlers (Segment 34) ---
+
+// subscriptionInput is the request body accepted by CreateSubscriptionHandler.
+// Enabled defaults to true when omitted from the JSON body.
+type subscriptionInput struct {
+	URL      string   `json:"url"`
+	Service  string   `json:"service"`
+	Events   []string `json:"events"`
+	Secret   string   `json:"secret,omitempty"`
+	TenantID string   `json:"tenant_id,omitempty"`
+	Enabled  *bool    `json:"enabled"` // nil = not provided → defaults to true
+}
+
+// ListSubscriptionsHandler handles GET /sites/{site_id}/webhooks/subscriptions.
+// Returns a paginated JSON array of all locally-stored webhook subscriptions
+// for the current site.
+func ListSubscriptionsHandler(w http.ResponseWriter, r *http.Request) {
+	sc, ok := site.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "site context missing", http.StatusInternalServerError)
+		return
+	}
+	cursor, limit, ok := parsePaginationParams(w, r)
+	if !ok {
+		return
+	}
+
+	keys, nextCursor, err := sc.Store.ListPage(webhooks.SubscriptionsBucket, cursor, limit)
+	if err != nil {
+		slog.Error("subscriptions: list failed", "site_id", sc.SiteID, "error", err)
+		http.Error(w, "failed to list subscriptions", http.StatusInternalServerError)
+		return
+	}
+
+	p := webhooks.NewStoreProvider(sc.Store)
+	subs := make([]webhooks.Subscription, 0, len(keys))
+	for _, key := range keys {
+		sub, err := p.Get(r.Context(), key)
+		if err != nil {
+			slog.Warn("subscriptions: get during list failed", "site_id", sc.SiteID, "key", key, "error", err)
+			continue
+		}
+		subs = append(subs, sub)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
+		"site_id":       sc.SiteID,
+		"subscriptions": subs,
+		"next_cursor":   nextCursor,
+	})
+}
+
+// CreateSubscriptionHandler handles POST /sites/{site_id}/webhooks/subscriptions.
+// Accepts a JSON body with url, service, and events (all required); secret,
+// tenant_id, and enabled are optional. Enabled defaults to true when omitted.
+// Returns 201 with the stored subscription on success.
+func CreateSubscriptionHandler(w http.ResponseWriter, r *http.Request) {
+	sc, ok := site.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "site context missing", http.StatusInternalServerError)
+		return
+	}
+
+	var input subscriptionInput
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		http.Error(w, "request body must be valid JSON", http.StatusBadRequest)
+		return
+	}
+
+	// Validate required fields.
+	var missing []string
+	if input.URL == "" {
+		missing = append(missing, "url")
+	}
+	if input.Service == "" {
+		missing = append(missing, "service")
+	}
+	if len(input.Events) == 0 {
+		missing = append(missing, "events")
+	}
+	if len(missing) > 0 {
+		http.Error(w, "missing required fields: "+strings.Join(missing, ", "), http.StatusBadRequest)
+		return
+	}
+
+	// Default enabled to true when the caller did not specify it.
+	enabled := true
+	if input.Enabled != nil {
+		enabled = *input.Enabled
+	}
+
+	sub := webhooks.Subscription{
+		URL:      input.URL,
+		Service:  input.Service,
+		Events:   input.Events,
+		Secret:   input.Secret,
+		TenantID: input.TenantID,
+		Enabled:  enabled,
+	}
+
+	p := webhooks.NewStoreProvider(sc.Store)
+	created, err := p.Create(r.Context(), sub)
+	if err != nil {
+		slog.Error("subscriptions: create failed", "site_id", sc.SiteID, "error", err)
+		http.Error(w, "failed to create subscription", http.StatusInternalServerError)
+		return
+	}
+	slog.Info("subscription created", "site_id", sc.SiteID, "id", created.ID, "url", created.URL)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(created) //nolint:errcheck
+}
+
+// GetSubscriptionHandler handles GET /sites/{site_id}/webhooks/subscriptions/{id}.
+// Returns a single stored subscription by its ID.
+func GetSubscriptionHandler(w http.ResponseWriter, r *http.Request) {
+	sc, ok := site.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "site context missing", http.StatusInternalServerError)
+		return
+	}
+	id := chi.URLParam(r, "id")
+
+	p := webhooks.NewStoreProvider(sc.Store)
+	sub, err := p.Get(r.Context(), id)
+	if err != nil {
+		if webhooks.IsNotFound(err) {
+			http.Error(w, "subscription not found", http.StatusNotFound)
+			return
+		}
+		slog.Error("subscriptions: get failed", "site_id", sc.SiteID, "id", id, "error", err)
+		http.Error(w, "failed to get subscription", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(sub) //nolint:errcheck
+}
+
+// DeleteSubscriptionHandler handles DELETE /sites/{site_id}/webhooks/subscriptions/{id}.
+// Permanently removes a single stored subscription.
+func DeleteSubscriptionHandler(w http.ResponseWriter, r *http.Request) {
+	sc, ok := site.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "site context missing", http.StatusInternalServerError)
+		return
+	}
+	id := chi.URLParam(r, "id")
+
+	p := webhooks.NewStoreProvider(sc.Store)
+	if err := p.Delete(r.Context(), id); err != nil {
+		if webhooks.IsNotFound(err) {
+			http.Error(w, "subscription not found", http.StatusNotFound)
+			return
+		}
+		slog.Error("subscriptions: delete failed", "site_id", sc.SiteID, "id", id, "error", err)
+		http.Error(w, "failed to delete subscription", http.StatusInternalServerError)
+		return
+	}
+	slog.Info("subscription deleted", "site_id", sc.SiteID, "id", id)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// subscriptionPatchInput is the request body accepted by UpdateSubscriptionHandler.
+// All fields are optional; omitted fields leave the existing value unchanged.
+// An explicit null for events replaces the list with an empty slice.
+type subscriptionPatchInput struct {
+	URL      *string  `json:"url"`
+	Service  *string  `json:"service"`
+	Events   []string `json:"events"`    // nil = keep existing; non-nil replaces
+	Secret   *string  `json:"secret"`
+	TenantID *string  `json:"tenant_id"`
+	Enabled  *bool    `json:"enabled"`
+}
+
+// UpdateSubscriptionHandler handles PATCH /sites/{site_id}/webhooks/subscriptions/{id}.
+// Applies a partial update to the stored subscription: only fields present in
+// the request body are changed; all others retain their current values.
+// Returns 200 with the updated subscription on success.
+func UpdateSubscriptionHandler(w http.ResponseWriter, r *http.Request) {
+	sc, ok := site.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "site context missing", http.StatusInternalServerError)
+		return
+	}
+	id := chi.URLParam(r, "id")
+
+	var input subscriptionPatchInput
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		http.Error(w, "request body must be valid JSON", http.StatusBadRequest)
+		return
+	}
+
+	patch := webhooks.SubscriptionPatch{
+		URL:      input.URL,
+		Service:  input.Service,
+		Events:   input.Events,
+		Secret:   input.Secret,
+		TenantID: input.TenantID,
+		Enabled:  input.Enabled,
+	}
+
+	p := webhooks.NewStoreProvider(sc.Store)
+	updated, err := p.Update(r.Context(), id, patch)
+	if err != nil {
+		if webhooks.IsNotFound(err) {
+			http.Error(w, "subscription not found", http.StatusNotFound)
+			return
+		}
+		slog.Error("subscriptions: update failed", "site_id", sc.SiteID, "id", id, "error", err)
+		http.Error(w, "failed to update subscription", http.StatusInternalServerError)
+		return
+	}
+	slog.Info("subscription updated", "site_id", sc.SiteID, "id", id)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(updated) //nolint:errcheck
 }
 
 // --- helpers ---
@@ -604,9 +1135,138 @@ func listFilteredPage(store storage.Store, bucket, cursor string, limit int, f l
 	}
 	return out, "", nil
 }
-		
 
+// --- Tenant-scoped storage helpers (Segment 19) ---
 
+// tenantKey prefixes key with the tenant namespace when tenantID is non-empty,
+// ensuring events, artifacts, and audit entries are physically separated per
+// tenant within the same site store bucket.
+// Returns key unchanged when tenantID is empty (legacy mode).
+func tenantKey(tenantID, key string) string {
+	if tenantID == "" {
+		return key
+	}
+	return tenantID + "/" + key
+}
 
+// applyTenantFilter adjusts cursor and filter for tenant-scoped list operations.
+// It returns the storage-level cursor (tenant-prefixed when non-empty), the
+// updated filter with the tenant prefix injected, and the tenant prefix string
+// that must be stripped from keys and nextCursor before they are returned to
+// the caller.
+func applyTenantFilter(tenantID, cursor string, f listFilter) (adjustedCursor string, adjustedFilter listFilter, tenantPrefix string) {
+	if tenantID == "" {
+		return cursor, f, ""
+	}
+	prefix := tenantID + "/"
+	// Re-add tenant prefix to the incoming cursor so it matches storage keys.
+	if cursor != "" {
+		cursor = prefix + cursor
+	}
+	// Prepend tenant prefix to any user-supplied prefix filter.
+	if f.Prefix == "" {
+		f.Prefix = prefix
+	} else {
+		f.Prefix = prefix + f.Prefix
+	}
+	return cursor, f, prefix
+}
 
+// stripTenantPrefix removes tenantPrefix from every key in keys and from
+// nextCursor, producing the bare client-visible names without the tenant
+// namespace. When tenantPrefix is empty the slices are returned unchanged.
+func stripTenantPrefix(tenantPrefix string, keys []string, nextCursor string) ([]string, string) {
+	if tenantPrefix == "" {
+		return keys, nextCursor
+	}
+	for i, k := range keys {
+		keys[i] = strings.TrimPrefix(k, tenantPrefix)
+	}
+	return keys, strings.TrimPrefix(nextCursor, tenantPrefix)
+}
 
+// --- Schema validation helpers (Segment 20) ---
+
+// validateJSONFields checks that every field name in required is present as a
+// top-level key in the JSON object body. It returns the names of any missing
+// fields. A non-object body (array, scalar) returns nil (no missing fields) so
+// that callers fall through to the existing JSON-validity check.
+func validateJSONFields(body []byte, required []string) []string {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(body, &m); err != nil {
+		// Body is not a JSON object — let the caller surface a 400.
+		return nil
+	}
+	var missing []string
+	for _, field := range required {
+		if _, ok := m[field]; !ok {
+			missing = append(missing, field)
+		}
+	}
+	return missing
+}
+
+// --- Log-level toggle ---
+
+// LogLevelHandler handles GET /debug/log-level.
+// Returns the current effective slog level and whether it is runtime-managed.
+// When OpsConfig.LogLevel is nil the response reports level "INFO" and
+// managed=false; the level cannot be changed in that configuration.
+func LogLevelHandler(lv *slog.LevelVar) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if lv == nil {
+			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
+				"level":   slog.LevelInfo.String(),
+				"managed": false,
+			})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
+			"level":   lv.Level().String(),
+			"managed": true,
+		})
+	}
+}
+
+// SetLogLevelHandler handles PUT /debug/log-level.
+// Accepts {"level":"DEBUG"} and updates the process-wide slog level at runtime.
+// Returns 501 Not Implemented when OpsConfig.LogLevel is nil.
+// Accepted level strings (case-insensitive): DEBUG, INFO, WARN, ERROR.
+func SetLogLevelHandler(lv *slog.LevelVar) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if lv == nil {
+			http.Error(w, "log level is not runtime-configurable", http.StatusNotImplemented)
+			return
+		}
+
+		body, err := io.ReadAll(io.LimitReader(r.Body, 1024))
+		if err != nil {
+			http.Error(w, "failed to read body", http.StatusBadRequest)
+			return
+		}
+
+		var req struct {
+			Level string `json:"level"`
+		}
+		if err := json.Unmarshal(body, &req); err != nil {
+			http.Error(w, "invalid JSON body", http.StatusBadRequest)
+			return
+		}
+
+		var l slog.Level
+		if err := l.UnmarshalText([]byte(strings.TrimSpace(req.Level))); err != nil {
+			http.Error(w, fmt.Sprintf("unknown log level %q; use DEBUG, INFO, WARN, or ERROR", req.Level), http.StatusBadRequest)
+			return
+		}
+
+		lv.Set(l)
+		slog.Info("log level changed", "level", l.String())
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
+			"level":   lv.Level().String(),
+			"managed": true,
+		})
+	}
+}

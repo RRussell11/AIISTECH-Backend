@@ -1,8 +1,13 @@
 package http_test
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
 	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 
@@ -170,5 +175,373 @@ func TestAuditMiddleware_DeleteDispatchFired(t *testing.T) {
 	}
 	if len(evts) > 0 && evts[0].Type != "audit.write" {
 		t.Errorf("event Type = %q, want %q", evts[0].Type, "audit.write")
+	}
+}
+
+// --- Tenant mode (SiteMiddleware) ---
+
+// newTenantRouter creates a router for a site that has tenant mode enabled.
+// It writes a config.yaml with two tenants into the temp directory so that
+// SiteMiddleware picks it up.
+func newTenantRouter(t *testing.T) http.Handler {
+	t.Helper()
+	dir := t.TempDir()
+	t.Chdir(dir)
+
+	cfgDir := filepath.Join(dir, "contracts", "sites", "local")
+	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
+		t.Fatalf("mkdir config dir: %v", err)
+	}
+	cfgYAML := `site_id: local
+tenants:
+  - tenant_id: acme
+    api_key: "acme-secret"
+  - tenant_id: globex
+    api_key: "globex-secret"
+`
+	if err := os.WriteFile(filepath.Join(cfgDir, "config.yaml"), []byte(cfgYAML), 0o600); err != nil {
+		t.Fatalf("writing config: %v", err)
+	}
+
+	stores := storage.NewRegistry()
+	t.Cleanup(func() { stores.CloseAll() })
+	return chihttp.NewRouter(makeTestRegistry(t), stores, nil)
+}
+
+// doWithHeaders performs an HTTP request with the given extra headers.
+func doWithHeaders(t *testing.T, router http.Handler, method, path string, headers map[string]string) *httptest.ResponseRecorder {
+	t.Helper()
+	req, err := http.NewRequest(method, path, nil)
+	if err != nil {
+		t.Fatalf("building request: %v", err)
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+	return rr
+}
+
+// TestSiteMiddleware_TenantMode_MissingTenantID returns 400 when X-Tenant-ID is absent.
+func TestSiteMiddleware_TenantMode_MissingTenantID(t *testing.T) {
+	rr := doWithHeaders(t, newTenantRouter(t), http.MethodGet, "/sites/local/healthz", map[string]string{
+		"Authorization": "Bearer acme-secret",
+	})
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rr.Code)
+	}
+}
+
+// TestSiteMiddleware_TenantMode_UnknownTenant returns 400 for an unknown X-Tenant-ID.
+func TestSiteMiddleware_TenantMode_UnknownTenant(t *testing.T) {
+	rr := doWithHeaders(t, newTenantRouter(t), http.MethodGet, "/sites/local/healthz", map[string]string{
+		"X-Tenant-ID":   "unknown",
+		"Authorization": "Bearer acme-secret",
+	})
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rr.Code)
+	}
+}
+
+// TestSiteMiddleware_TenantMode_MissingAuth returns 401 when Authorization is absent.
+func TestSiteMiddleware_TenantMode_MissingAuth(t *testing.T) {
+	rr := doWithHeaders(t, newTenantRouter(t), http.MethodGet, "/sites/local/healthz", map[string]string{
+		"X-Tenant-ID": "acme",
+	})
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", rr.Code)
+	}
+	if rr.Header().Get("WWW-Authenticate") == "" {
+		t.Error("expected WWW-Authenticate header on 401")
+	}
+}
+
+// TestSiteMiddleware_TenantMode_WrongToken returns 401 when the bearer token is wrong.
+func TestSiteMiddleware_TenantMode_WrongToken(t *testing.T) {
+	rr := doWithHeaders(t, newTenantRouter(t), http.MethodGet, "/sites/local/healthz", map[string]string{
+		"X-Tenant-ID":   "acme",
+		"Authorization": "Bearer wrong-secret",
+	})
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", rr.Code)
+	}
+}
+
+// TestSiteMiddleware_TenantMode_CrossTenantToken returns 401 when using another tenant's key.
+func TestSiteMiddleware_TenantMode_CrossTenantToken(t *testing.T) {
+	rr := doWithHeaders(t, newTenantRouter(t), http.MethodGet, "/sites/local/healthz", map[string]string{
+		"X-Tenant-ID":   "acme",
+		"Authorization": "Bearer globex-secret",
+	})
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", rr.Code)
+	}
+}
+
+// TestSiteMiddleware_TenantMode_ValidRequest succeeds with correct credentials.
+func TestSiteMiddleware_TenantMode_ValidRequest(t *testing.T) {
+	rr := doWithHeaders(t, newTenantRouter(t), http.MethodGet, "/sites/local/healthz", map[string]string{
+		"X-Tenant-ID":   "acme",
+		"Authorization": "Bearer acme-secret",
+	})
+	if rr.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200; body: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// TestSiteMiddleware_TenantMode_EnforcedOnGET verifies that GET requests require auth in tenant mode.
+func TestSiteMiddleware_TenantMode_EnforcedOnGET(t *testing.T) {
+	rr := doWithHeaders(t, newTenantRouter(t), http.MethodGet, "/sites/local/healthz", nil)
+	if rr.Code == http.StatusOK {
+		t.Error("expected non-200 for unauthenticated GET in tenant mode")
+	}
+}
+
+// TestSiteMiddleware_LegacyMode_GetOpenWithoutAuth verifies that legacy mode
+// (no tenants configured) still allows GET without credentials.
+func TestSiteMiddleware_LegacyMode_GetOpenWithoutAuth(t *testing.T) {
+	t.Chdir(t.TempDir())
+	stores := storage.NewRegistry()
+	t.Cleanup(func() { stores.CloseAll() })
+	router := chihttp.NewRouter(makeTestRegistry(t), stores, nil)
+
+	rr := do(t, router, http.MethodGet, "/sites/local/healthz", nil)
+	if rr.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200; body: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// newOpsRouter builds a router with the given OpsConfig wired in.
+func newOpsRouter(t *testing.T, ops chihttp.OpsConfig) http.Handler {
+	t.Helper()
+	stores := storage.NewRegistry()
+	t.Cleanup(func() { stores.CloseAll() })
+	return chihttp.NewRouter(makeTestRegistry(t), stores, nil, ops)
+}
+
+// ---- CORSMiddleware tests ----
+
+// TestCORS_WildcardSetsHeader verifies that a wildcard config echoes the request
+// Origin in Access-Control-Allow-Origin.
+func TestCORS_WildcardSetsHeader(t *testing.T) {
+	router := newOpsRouter(t, chihttp.OpsConfig{CORSOrigins: "*"})
+	req, _ := http.NewRequest(http.MethodGet, "/healthz", nil)
+	req.Header.Set("Origin", "https://example.com")
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	if got := rr.Header().Get("Access-Control-Allow-Origin"); got != "https://example.com" {
+		t.Errorf("ACAO = %q, want %q", got, "https://example.com")
+	}
+}
+
+// TestCORS_SpecificOriginAllowed verifies that a listed origin is reflected.
+func TestCORS_SpecificOriginAllowed(t *testing.T) {
+	router := newOpsRouter(t, chihttp.OpsConfig{CORSOrigins: "https://allowed.com"})
+	req, _ := http.NewRequest(http.MethodGet, "/healthz", nil)
+	req.Header.Set("Origin", "https://allowed.com")
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	if got := rr.Header().Get("Access-Control-Allow-Origin"); got != "https://allowed.com" {
+		t.Errorf("ACAO = %q, want %q", got, "https://allowed.com")
+	}
+}
+
+// TestCORS_UnlistedOriginBlocked verifies that an unlisted origin does not receive the header.
+func TestCORS_UnlistedOriginBlocked(t *testing.T) {
+	router := newOpsRouter(t, chihttp.OpsConfig{CORSOrigins: "https://allowed.com"})
+	req, _ := http.NewRequest(http.MethodGet, "/healthz", nil)
+	req.Header.Set("Origin", "https://attacker.com")
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	if got := rr.Header().Get("Access-Control-Allow-Origin"); got != "" {
+		t.Errorf("ACAO = %q, want empty for unlisted origin", got)
+	}
+}
+
+// TestCORS_PreflightReturns204 verifies that OPTIONS pre-flight returns 204 with no body.
+func TestCORS_PreflightReturns204(t *testing.T) {
+	router := newOpsRouter(t, chihttp.OpsConfig{CORSOrigins: "*"})
+	req, _ := http.NewRequest(http.MethodOptions, "/healthz", nil)
+	req.Header.Set("Origin", "https://example.com")
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusNoContent {
+		t.Errorf("status = %d, want 204", rr.Code)
+	}
+	if got := rr.Header().Get("Access-Control-Allow-Origin"); got == "" {
+		t.Error("expected ACAO header on OPTIONS pre-flight")
+	}
+}
+
+// TestCORS_Disabled verifies that no CORS headers are added when CORSOrigins is "".
+func TestCORS_Disabled(t *testing.T) {
+	router := newOpsRouter(t, chihttp.OpsConfig{})
+	req, _ := http.NewRequest(http.MethodGet, "/healthz", nil)
+	req.Header.Set("Origin", "https://example.com")
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	if got := rr.Header().Get("Access-Control-Allow-Origin"); got != "" {
+		t.Errorf("ACAO = %q, want empty when CORS is disabled", got)
+	}
+}
+
+// ---- MaxBodyMiddleware tests ----
+
+// TestMaxBody_WithinLimit verifies that a request within the limit is processed normally.
+func TestMaxBody_WithinLimit(t *testing.T) {
+	t.Chdir(t.TempDir())
+	router := newOpsRouter(t, chihttp.OpsConfig{MaxBodyBytes: 1024})
+	body := []byte(`{"small":true}`)
+	req, _ := http.NewRequest(http.MethodPost, "/sites/local/events", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusCreated {
+		t.Errorf("status = %d, want 201", rr.Code)
+	}
+}
+
+// TestMaxBody_ExceedsLimit verifies that an oversized body results in a non-2xx response.
+func TestMaxBody_ExceedsLimit(t *testing.T) {
+	t.Chdir(t.TempDir())
+	// Set a very small limit (10 bytes) so even a tiny JSON body is over.
+	router := newOpsRouter(t, chihttp.OpsConfig{MaxBodyBytes: 10})
+	body := []byte(`{"this_key_is_definitely_too_long": true}`)
+	req, _ := http.NewRequest(http.MethodPost, "/sites/local/events", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	// chi's Recoverer catches the MaxBytesError and returns 413 or the handler
+	// returns 400 on body-read failure; either way the response must not be 2xx.
+	if rr.Code >= 200 && rr.Code < 300 {
+		t.Errorf("status = %d, want non-2xx for oversized body", rr.Code)
+	}
+}
+
+// ---- RateLimitMiddleware tests ----
+
+// TestRateLimit_BelowLimit verifies that requests within the limit succeed.
+func TestRateLimit_BelowLimit(t *testing.T) {
+	// 10 RPS, burst=10 — first request must always go through.
+	router := newOpsRouter(t, chihttp.OpsConfig{RateLimitRPS: 10, RateLimitBurst: 10})
+	req, _ := http.NewRequest(http.MethodGet, "/healthz", nil)
+	req.RemoteAddr = "192.0.2.1:12345"
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200 for first request within burst", rr.Code)
+	}
+}
+
+// TestRateLimit_ExceedsLimit verifies that a burst of requests beyond the limit
+// receives 429 Too Many Requests.
+func TestRateLimit_ExceedsLimit(t *testing.T) {
+	// 1 RPS, burst=1 — second consecutive request from same IP should be throttled.
+	router := newOpsRouter(t, chihttp.OpsConfig{RateLimitRPS: 1, RateLimitBurst: 1})
+
+	var lastCode int
+	for i := 0; i < 20; i++ {
+		req, _ := http.NewRequest(http.MethodGet, "/healthz", nil)
+		req.RemoteAddr = "192.0.2.42:9999"
+		rr := httptest.NewRecorder()
+		router.ServeHTTP(rr, req)
+		lastCode = rr.Code
+		if rr.Code == http.StatusTooManyRequests {
+			return // got the expected 429
+		}
+	}
+	t.Errorf("last status = %d; expected at least one 429 after exhausting burst", lastCode)
+}
+
+// TestRateLimit_Disabled verifies that no rate limiting occurs when RPS is 0.
+func TestRateLimit_Disabled(t *testing.T) {
+	router := newOpsRouter(t, chihttp.OpsConfig{RateLimitRPS: 0})
+	for i := 0; i < 50; i++ {
+		req, _ := http.NewRequest(http.MethodGet, "/healthz", nil)
+		req.RemoteAddr = "192.0.2.99:1234"
+		rr := httptest.NewRecorder()
+		router.ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("request %d: status = %d, want 200 with rate limiting disabled", i, rr.Code)
+		}
+	}
+}
+
+// TestRateLimit_DifferentIPsNotThrottled verifies that two distinct IPs have independent limiters.
+func TestRateLimit_DifferentIPsNotThrottled(t *testing.T) {
+	// burst=1 so a second request from the same IP would be throttled,
+	// but a request from a different IP should still succeed.
+	router := newOpsRouter(t, chihttp.OpsConfig{RateLimitRPS: 1, RateLimitBurst: 1})
+
+	for _, ip := range []string{"10.0.0.1", "10.0.0.2", "10.0.0.3"} {
+		req, _ := http.NewRequest(http.MethodGet, "/healthz", nil)
+		req.RemoteAddr = ip + ":8080"
+		rr := httptest.NewRecorder()
+		router.ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Errorf("IP %s: status = %d, want 200 (first request should pass)", ip, rr.Code)
+		}
+	}
+}
+
+// ---- TraceMiddleware / LoggerFromContext tests ----
+
+// TestTraceMiddleware_LoggerStoredInContext verifies that a request-scoped
+// *slog.Logger enriched with trace_id is retrievable via LoggerFromContext
+// inside the handler, and that it is a distinct instance from slog.Default().
+func TestTraceMiddleware_LoggerStoredInContext(t *testing.T) {
+	var capturedLogger *slog.Logger
+
+	handler := chihttp.TraceMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedLogger = chihttp.LoggerFromContext(r.Context())
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	if capturedLogger == nil {
+		t.Fatal("expected a non-nil logger in context, got nil")
+	}
+	// .With() returns a fresh *slog.Logger, so the pointer must differ from Default().
+	if capturedLogger == slog.Default() {
+		t.Error("expected an enriched logger (not slog.Default()) to be stored in context")
+	}
+}
+
+// TestTraceMiddleware_StatusCaptured verifies that the access-log line is
+// emitted (no panic) and the downstream handler still receives the correct
+// ResponseWriter (status 201 propagates correctly).
+func TestTraceMiddleware_StatusCaptured(t *testing.T) {
+	handler := chihttp.TraceMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/items", nil)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusCreated {
+		t.Errorf("response status = %d, want 201", rr.Code)
+	}
+}
+
+// TestLoggerFromContext_FallbackToDefault verifies that LoggerFromContext
+// returns slog.Default() when called with a plain context that has no stored
+// logger (e.g. in unit tests that bypass the middleware chain).
+func TestLoggerFromContext_FallbackToDefault(t *testing.T) {
+	l := chihttp.LoggerFromContext(context.Background())
+	if l != slog.Default() {
+		t.Error("expected slog.Default() as fallback when no logger is in context")
 	}
 }

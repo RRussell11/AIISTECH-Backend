@@ -14,18 +14,32 @@ import (
 // NewRouter builds and returns the application HTTP router.
 // disp may be nil; when non-nil it receives an "audit.write" webhook event
 // for every state-mutating request processed by AuditMiddleware.
-func NewRouter(reg *site.Registry, stores *storage.Registry, disp webhooks.Dispatcher) http.Handler {
+// ops is an optional OpsConfig that enables CORS, body-size limiting, and
+// per-IP rate limiting when the respective fields are non-zero.
+func NewRouter(reg *site.AtomicRegistry, stores *storage.Registry, disp webhooks.Dispatcher, ops ...OpsConfig) http.Handler {
+	var cfg OpsConfig
+	if len(ops) > 0 {
+		cfg = ops[0]
+	}
+
 	r := chi.NewRouter()
 	r.Use(middleware.Recoverer)
-	r.Use(middleware.RequestID) // injects X-Request-Id for audit traceability
-	r.Use(MetricsMiddleware)   // global request counter
+	r.Use(middleware.RequestID)               // injects X-Request-Id for audit traceability
+	r.Use(TraceMiddleware)                    // enriches context with trace_id logger; emits access log
+	r.Use(MetricsMiddleware)                  // global request counter
+	r.Use(CORSMiddleware(cfg.CORSOrigins))    // CORS headers + pre-flight; no-op when CORSOrigins is ""
+	r.Use(MaxBodyMiddleware(cfg.MaxBodyBytes)) // body size cap; no-op when MaxBodyBytes <= 0
+	r.Use(RateLimitMiddleware(cfg.RateLimitRPS, cfg.RateLimitBurst)) // per-IP rate limit; no-op when RPS <= 0
 
 	// Non-site-scoped routes
 	r.Get("/healthz", HealthzHandler)           // backward-compatible liveness
 	r.Get("/healthz/live", LivezHandler)        // explicit liveness probe
-	r.Get("/healthz/ready", ReadyzHandler(reg)) // readiness probe: registry loaded
+	r.Get("/healthz/ready", ReadyzHandler(reg, stores)) // readiness probe: registry + store accessibility
 	r.Get("/metrics", MetricsHandler)
+	r.Get("/version", VersionHandler)
 	r.Get("/sites", ListSitesHandler(reg))
+	r.Get("/debug/log-level", LogLevelHandler(cfg.LogLevel))
+	r.Put("/debug/log-level", SetLogLevelHandler(cfg.LogLevel))
 
 	// Site-scoped routes
 	r.Route("/sites/{site_id}", func(r chi.Router) {
@@ -38,12 +52,29 @@ func NewRouter(reg *site.Registry, stores *storage.Registry, disp webhooks.Dispa
 		r.Get("/events", ListEventsHandler)
 		r.Post("/events", PostEventHandler)
 		r.Get("/events/{filename}", GetEventHandler)
+		r.Delete("/events/{filename}", DeleteEventHandler)
 		r.Get("/artifacts", ListArtifactsHandler)
 		r.Post("/artifacts", PostArtifactHandler)
 		r.Get("/artifacts/{filename}", GetArtifactHandler)
 		r.Delete("/artifacts/{filename}", DeleteArtifactHandler)
 		r.Get("/audit", ListAuditHandler)
 		r.Get("/audit/{filename}", GetAuditHandler)
+
+		// Webhook DLQ — registered unconditionally; returns empty results when
+		// no failed deliveries have been stored for this site.
+		r.Get("/webhooks/dlq", ListDLQHandler)
+		r.Get("/webhooks/dlq/{id}", GetDLQHandler)
+		r.Delete("/webhooks/dlq/{id}", DeleteDLQHandler)
+		r.Post("/webhooks/dlq/{id}/replay", ReplayDLQHandler(cfg.ReplayClient))
+
+		// Webhook subscription management — stored locally in the site's bbolt
+		// store; use these routes to register, list, and remove subscriptions
+		// without requiring access to the PhaseMirror-HQ daemon.
+		r.Get("/webhooks/subscriptions", ListSubscriptionsHandler)
+		r.Post("/webhooks/subscriptions", CreateSubscriptionHandler)
+		r.Get("/webhooks/subscriptions/{id}", GetSubscriptionHandler)
+		r.Patch("/webhooks/subscriptions/{id}", UpdateSubscriptionHandler)
+		r.Delete("/webhooks/subscriptions/{id}", DeleteSubscriptionHandler)
 	})
 
 	return r

@@ -96,3 +96,94 @@ func TestLoadRegistry_FileNotFound(t *testing.T) {
 		t.Fatal("expected error for missing file")
 	}
 }
+
+// ---- AtomicRegistry tests ----
+
+func TestAtomicRegistry_LoadAndContains(t *testing.T) {
+	p := writeTempRegistry(t, `
+default_site_id: local
+sites:
+  - site_id: local
+  - site_id: staging
+`)
+	reg, err := site.LoadRegistry(p)
+	if err != nil {
+		t.Fatalf("LoadRegistry: %v", err)
+	}
+	ar := site.NewAtomicRegistry(reg)
+
+	if !ar.Contains("local") {
+		t.Error("should contain 'local'")
+	}
+	if !ar.Contains("staging") {
+		t.Error("should contain 'staging'")
+	}
+	if ar.Contains("unknown") {
+		t.Error("should not contain 'unknown'")
+	}
+	if ar.DefaultSiteID() != "local" {
+		t.Errorf("DefaultSiteID = %q, want %q", ar.DefaultSiteID(), "local")
+	}
+}
+
+func TestAtomicRegistry_HotSwap(t *testing.T) {
+	p1 := writeTempRegistry(t, `
+default_site_id: local
+sites:
+  - site_id: local
+`)
+	reg1, err := site.LoadRegistry(p1)
+	if err != nil {
+		t.Fatalf("LoadRegistry p1: %v", err)
+	}
+	ar := site.NewAtomicRegistry(reg1)
+
+	// Verify initial state.
+	if !ar.Contains("local") {
+		t.Error("initial: should contain 'local'")
+	}
+	if ar.Contains("staging") {
+		t.Error("initial: should not contain 'staging'")
+	}
+
+	// Swap to a registry that has 'staging' but not 'local'.
+	p2 := writeTempRegistry(t, `
+default_site_id: staging
+sites:
+  - site_id: staging
+`)
+	reg2, err := site.LoadRegistry(p2)
+	if err != nil {
+		t.Fatalf("LoadRegistry p2: %v", err)
+	}
+	ar.Store(reg2)
+
+	// Verify swapped state.
+	if ar.Contains("local") {
+		t.Error("after swap: should not contain 'local'")
+	}
+	if !ar.Contains("staging") {
+		t.Error("after swap: should contain 'staging'")
+	}
+	if ar.DefaultSiteID() != "staging" {
+		t.Errorf("after swap: DefaultSiteID = %q, want %q", ar.DefaultSiteID(), "staging")
+	}
+}
+
+func TestAtomicRegistry_SiteIDs(t *testing.T) {
+	p := writeTempRegistry(t, `
+default_site_id: alpha
+sites:
+  - site_id: alpha
+  - site_id: beta
+`)
+	reg, err := site.LoadRegistry(p)
+	if err != nil {
+		t.Fatalf("LoadRegistry: %v", err)
+	}
+	ar := site.NewAtomicRegistry(reg)
+	ids := ar.SiteIDs()
+	if len(ids) != 2 {
+		t.Errorf("SiteIDs len = %d, want 2", len(ids))
+	}
+}

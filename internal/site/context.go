@@ -3,6 +3,7 @@ package site
 import (
 	"context"
 
+	"github.com/RRussell11/AIISTECH-Backend/internal/config"
 	"github.com/RRussell11/AIISTECH-Backend/internal/storage"
 )
 
@@ -19,6 +20,9 @@ type SiteContext struct {
 	// It is typically sourced from the X-Tenant-ID header by SiteMiddleware.
 	// Empty means "no tenant scope" (the default bucket).
 	TenantID string
+	// Config is the full per-site configuration loaded at request time.
+	// Handlers use it for schema validation and other per-site settings.
+	Config config.SiteConfig
 }
 
 // NewContext returns a new context with sc attached.

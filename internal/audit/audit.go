@@ -10,6 +10,9 @@ import (
 type Entry struct {
 	RequestID string `json:"request_id"`
 	SiteID    string `json:"site_id"`
+	// TenantID is the resolved tenant identifier for the request, or empty when
+	// the site operates in legacy (non-tenant) mode.
+	TenantID  string `json:"tenant_id,omitempty"`
 	Method    string `json:"method"`
 	Path      string `json:"path"`
 	Status    int    `json:"status"`
@@ -37,6 +40,11 @@ func Write(e Entry, s Storer) error {
 	ns := time.Now().UnixNano()
 	seq := atomic.AddUint64(&auditSeq, 1)
 	key := fmt.Sprintf("%d-%d.json", ns, seq)
+	// Namespace the audit key by tenant when one is present so that per-tenant
+	// audit records are physically separated within the same site store.
+	if e.TenantID != "" {
+		key = e.TenantID + "/" + key
+	}
 
 	if err := s.Write("audit", key, data); err != nil {
 		return fmt.Errorf("writing audit entry: %w", err)

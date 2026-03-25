@@ -69,6 +69,16 @@ type Event struct {
 	// nanosecond-timestamped key matching the originating audit entry).
 	ID string `json:"id"`
 
+	// SiteID identifies the site that originated the event. It is used by
+	// WorkerDispatcher to route failed deliveries to the correct per-site
+	// Dead Letter Queue store, and is included in the delivered JSON payload
+	// for receiver-side correlation.
+	SiteID string `json:"site_id,omitempty"`
+
+	// TenantID is the tenant that originated the event. Empty when the site
+	// operates in legacy (non-tenant) mode.
+	TenantID string `json:"tenant_id,omitempty"`
+
 	// Type is the event type string (e.g. "audit.write").
 	Type string `json:"type"`
 
