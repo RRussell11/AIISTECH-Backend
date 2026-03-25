@@ -100,9 +100,36 @@ func main() {
 			}
 		}
 
+		// Circuit breaker — optional. Enabled when CB_FAILURE_THRESHOLD > 0.
+		//   AIISTECH_WEBHOOK_CB_FAILURE_THRESHOLD    — consecutive exhausted-retry
+		//                                              failures before tripping (default: disabled)
+		//   AIISTECH_WEBHOOK_CB_OPEN_DURATION_SECONDS — seconds to stay open before
+		//                                              half-open trial (default: 60)
+		var circuitBreakerCfg *webhooks.CircuitBreakerConfig
+		if cbThresholdStr := os.Getenv("AIISTECH_WEBHOOK_CB_FAILURE_THRESHOLD"); cbThresholdStr != "" {
+			if cbThreshold, err := strconv.Atoi(cbThresholdStr); err != nil || cbThreshold <= 0 {
+				slog.Warn("invalid AIISTECH_WEBHOOK_CB_FAILURE_THRESHOLD, circuit breaking disabled", "value", cbThresholdStr)
+			} else {
+				cbCfg := webhooks.CircuitBreakerConfig{FailureThreshold: cbThreshold}
+				if cbDurStr := os.Getenv("AIISTECH_WEBHOOK_CB_OPEN_DURATION_SECONDS"); cbDurStr != "" {
+					if cbDurSec, err := strconv.Atoi(cbDurStr); err != nil || cbDurSec <= 0 {
+						slog.Warn("invalid AIISTECH_WEBHOOK_CB_OPEN_DURATION_SECONDS, using default", "value", cbDurStr)
+					} else {
+						cbCfg.OpenDuration = time.Duration(cbDurSec) * time.Second
+					}
+				}
+				circuitBreakerCfg = &cbCfg
+				slog.Info("webhook circuit breaker enabled",
+					"failure_threshold", cbCfg.FailureThreshold,
+					"open_duration", cbCfg.OpenDuration,
+				)
+			}
+		}
+
 		wd := webhooks.NewWorkerDispatcher(webhooks.Config{
-			ServiceName: serviceName,
-			DLQ:         dlqSink, // failed deliveries go to per-site webhook_dlq bucket
+			ServiceName:    serviceName,
+			DLQ:            dlqSink, // failed deliveries go to per-site webhook_dlq bucket
+			CircuitBreaker: circuitBreakerCfg,
 		}, provider)
 		disp = wd
 		slog.Info("webhook dispatcher started with DLQ", "service", serviceName, "base_url", webhookBase)

@@ -71,4 +71,13 @@ type Config struct {
 	// attempts without receiving a 2xx response. A nil DLQ silently discards
 	// such failures (existing behaviour).
 	DLQ DLQSink
+
+	// CircuitBreaker enables per-subscription circuit breaking when non-nil.
+	// Each subscription maintains an independent three-state breaker
+	// (Closed → Open → Half-Open) that fast-fails deliveries while the
+	// subscriber endpoint is consistently unhealthy, avoiding wasted retry
+	// cycles and unnecessary DLQ growth.
+	// When nil, circuit breaking is disabled and all subscriptions are always
+	// attempted (existing behaviour).
+	CircuitBreaker *CircuitBreakerConfig
 }
