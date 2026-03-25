@@ -14,11 +14,21 @@ import (
 // NewRouter builds and returns the application HTTP router.
 // disp may be nil; when non-nil it receives an "audit.write" webhook event
 // for every state-mutating request processed by AuditMiddleware.
-func NewRouter(reg *site.Registry, stores *storage.Registry, disp webhooks.Dispatcher) http.Handler {
+// ops is an optional OpsConfig that enables CORS, body-size limiting, and
+// per-IP rate limiting when the respective fields are non-zero.
+func NewRouter(reg *site.Registry, stores *storage.Registry, disp webhooks.Dispatcher, ops ...OpsConfig) http.Handler {
+	var cfg OpsConfig
+	if len(ops) > 0 {
+		cfg = ops[0]
+	}
+
 	r := chi.NewRouter()
 	r.Use(middleware.Recoverer)
-	r.Use(middleware.RequestID) // injects X-Request-Id for audit traceability
-	r.Use(MetricsMiddleware)   // global request counter
+	r.Use(middleware.RequestID)               // injects X-Request-Id for audit traceability
+	r.Use(MetricsMiddleware)                  // global request counter
+	r.Use(CORSMiddleware(cfg.CORSOrigins))    // CORS headers + pre-flight; no-op when CORSOrigins is ""
+	r.Use(MaxBodyMiddleware(cfg.MaxBodyBytes)) // body size cap; no-op when MaxBodyBytes <= 0
+	r.Use(RateLimitMiddleware(cfg.RateLimitRPS, cfg.RateLimitBurst)) // per-IP rate limit; no-op when RPS <= 0
 
 	// Non-site-scoped routes
 	r.Get("/healthz", HealthzHandler)           // backward-compatible liveness

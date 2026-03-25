@@ -104,7 +104,42 @@ func main() {
 		addr = v
 	}
 
-	router := sitehttp.NewRouter(reg, stores, disp)
+	// Ops middleware — all optional, disabled when env vars are absent.
+	//   AIISTECH_CORS_ALLOW_ORIGINS — comma-separated allowed origins; "*" = any
+	//   AIISTECH_MAX_BODY_BYTES     — hard cap on request body size (bytes)
+	//   AIISTECH_RATE_LIMIT_RPS     — steady-state requests/second per remote IP
+	//   AIISTECH_RATE_LIMIT_BURST   — token-bucket burst (defaults to max(1,RPS))
+	ops := sitehttp.OpsConfig{
+		CORSOrigins: os.Getenv("AIISTECH_CORS_ALLOW_ORIGINS"),
+	}
+	if v := os.Getenv("AIISTECH_MAX_BODY_BYTES"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err != nil || n <= 0 {
+			slog.Warn("invalid AIISTECH_MAX_BODY_BYTES, body-size limit disabled", "value", v)
+		} else {
+			ops.MaxBodyBytes = n
+			slog.Info("request body size limit enabled", "max_bytes", n)
+		}
+	}
+	if v := os.Getenv("AIISTECH_RATE_LIMIT_RPS"); v != "" {
+		if rps, err := strconv.ParseFloat(v, 64); err != nil || rps <= 0 {
+			slog.Warn("invalid AIISTECH_RATE_LIMIT_RPS, rate limiting disabled", "value", v)
+		} else {
+			ops.RateLimitRPS = rps
+			if bv := os.Getenv("AIISTECH_RATE_LIMIT_BURST"); bv != "" {
+				if burst, err := strconv.Atoi(bv); err != nil || burst <= 0 {
+					slog.Warn("invalid AIISTECH_RATE_LIMIT_BURST, using default", "value", bv)
+				} else {
+					ops.RateLimitBurst = burst
+				}
+			}
+			slog.Info("rate limiting enabled", "rps", rps, "burst", ops.RateLimitBurst)
+		}
+	}
+	if ops.CORSOrigins != "" {
+		slog.Info("CORS enabled", "origins", ops.CORSOrigins)
+	}
+
+	router := sitehttp.NewRouter(reg, stores, disp, ops)
 
 	srv := &http.Server{
 		Addr:    addr,

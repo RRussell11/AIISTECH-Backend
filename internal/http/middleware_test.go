@@ -1,6 +1,7 @@
 package http_test
 
 import (
+	"bytes"
 	"context"
 	"net/http"
 	"net/http/httptest"
@@ -307,5 +308,186 @@ func TestSiteMiddleware_LegacyMode_GetOpenWithoutAuth(t *testing.T) {
 	rr := do(t, router, http.MethodGet, "/sites/local/healthz", nil)
 	if rr.Code != http.StatusOK {
 		t.Errorf("status = %d, want 200; body: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// newOpsRouter builds a router with the given OpsConfig wired in.
+func newOpsRouter(t *testing.T, ops chihttp.OpsConfig) http.Handler {
+	t.Helper()
+	stores := storage.NewRegistry()
+	t.Cleanup(func() { stores.CloseAll() })
+	return chihttp.NewRouter(makeTestRegistry(t), stores, nil, ops)
+}
+
+// ---- CORSMiddleware tests ----
+
+// TestCORS_WildcardSetsHeader verifies that a wildcard config echoes the request
+// Origin in Access-Control-Allow-Origin.
+func TestCORS_WildcardSetsHeader(t *testing.T) {
+	router := newOpsRouter(t, chihttp.OpsConfig{CORSOrigins: "*"})
+	req, _ := http.NewRequest(http.MethodGet, "/healthz", nil)
+	req.Header.Set("Origin", "https://example.com")
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	if got := rr.Header().Get("Access-Control-Allow-Origin"); got != "https://example.com" {
+		t.Errorf("ACAO = %q, want %q", got, "https://example.com")
+	}
+}
+
+// TestCORS_SpecificOriginAllowed verifies that a listed origin is reflected.
+func TestCORS_SpecificOriginAllowed(t *testing.T) {
+	router := newOpsRouter(t, chihttp.OpsConfig{CORSOrigins: "https://allowed.com"})
+	req, _ := http.NewRequest(http.MethodGet, "/healthz", nil)
+	req.Header.Set("Origin", "https://allowed.com")
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	if got := rr.Header().Get("Access-Control-Allow-Origin"); got != "https://allowed.com" {
+		t.Errorf("ACAO = %q, want %q", got, "https://allowed.com")
+	}
+}
+
+// TestCORS_UnlistedOriginBlocked verifies that an unlisted origin does not receive the header.
+func TestCORS_UnlistedOriginBlocked(t *testing.T) {
+	router := newOpsRouter(t, chihttp.OpsConfig{CORSOrigins: "https://allowed.com"})
+	req, _ := http.NewRequest(http.MethodGet, "/healthz", nil)
+	req.Header.Set("Origin", "https://attacker.com")
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	if got := rr.Header().Get("Access-Control-Allow-Origin"); got != "" {
+		t.Errorf("ACAO = %q, want empty for unlisted origin", got)
+	}
+}
+
+// TestCORS_PreflightReturns204 verifies that OPTIONS pre-flight returns 204 with no body.
+func TestCORS_PreflightReturns204(t *testing.T) {
+	router := newOpsRouter(t, chihttp.OpsConfig{CORSOrigins: "*"})
+	req, _ := http.NewRequest(http.MethodOptions, "/healthz", nil)
+	req.Header.Set("Origin", "https://example.com")
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusNoContent {
+		t.Errorf("status = %d, want 204", rr.Code)
+	}
+	if got := rr.Header().Get("Access-Control-Allow-Origin"); got == "" {
+		t.Error("expected ACAO header on OPTIONS pre-flight")
+	}
+}
+
+// TestCORS_Disabled verifies that no CORS headers are added when CORSOrigins is "".
+func TestCORS_Disabled(t *testing.T) {
+	router := newOpsRouter(t, chihttp.OpsConfig{})
+	req, _ := http.NewRequest(http.MethodGet, "/healthz", nil)
+	req.Header.Set("Origin", "https://example.com")
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	if got := rr.Header().Get("Access-Control-Allow-Origin"); got != "" {
+		t.Errorf("ACAO = %q, want empty when CORS is disabled", got)
+	}
+}
+
+// ---- MaxBodyMiddleware tests ----
+
+// TestMaxBody_WithinLimit verifies that a request within the limit is processed normally.
+func TestMaxBody_WithinLimit(t *testing.T) {
+	t.Chdir(t.TempDir())
+	router := newOpsRouter(t, chihttp.OpsConfig{MaxBodyBytes: 1024})
+	body := []byte(`{"small":true}`)
+	req, _ := http.NewRequest(http.MethodPost, "/sites/local/events", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusCreated {
+		t.Errorf("status = %d, want 201", rr.Code)
+	}
+}
+
+// TestMaxBody_ExceedsLimit verifies that an oversized body results in a non-2xx response.
+func TestMaxBody_ExceedsLimit(t *testing.T) {
+	t.Chdir(t.TempDir())
+	// Set a very small limit (10 bytes) so even a tiny JSON body is over.
+	router := newOpsRouter(t, chihttp.OpsConfig{MaxBodyBytes: 10})
+	body := []byte(`{"this_key_is_definitely_too_long": true}`)
+	req, _ := http.NewRequest(http.MethodPost, "/sites/local/events", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	// chi's Recoverer catches the MaxBytesError and returns 413 or the handler
+	// returns 400 on body-read failure; either way the response must not be 2xx.
+	if rr.Code >= 200 && rr.Code < 300 {
+		t.Errorf("status = %d, want non-2xx for oversized body", rr.Code)
+	}
+}
+
+// ---- RateLimitMiddleware tests ----
+
+// TestRateLimit_BelowLimit verifies that requests within the limit succeed.
+func TestRateLimit_BelowLimit(t *testing.T) {
+	// 10 RPS, burst=10 — first request must always go through.
+	router := newOpsRouter(t, chihttp.OpsConfig{RateLimitRPS: 10, RateLimitBurst: 10})
+	req, _ := http.NewRequest(http.MethodGet, "/healthz", nil)
+	req.RemoteAddr = "192.0.2.1:12345"
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200 for first request within burst", rr.Code)
+	}
+}
+
+// TestRateLimit_ExceedsLimit verifies that a burst of requests beyond the limit
+// receives 429 Too Many Requests.
+func TestRateLimit_ExceedsLimit(t *testing.T) {
+	// 1 RPS, burst=1 — second consecutive request from same IP should be throttled.
+	router := newOpsRouter(t, chihttp.OpsConfig{RateLimitRPS: 1, RateLimitBurst: 1})
+
+	var lastCode int
+	for i := 0; i < 20; i++ {
+		req, _ := http.NewRequest(http.MethodGet, "/healthz", nil)
+		req.RemoteAddr = "192.0.2.42:9999"
+		rr := httptest.NewRecorder()
+		router.ServeHTTP(rr, req)
+		lastCode = rr.Code
+		if rr.Code == http.StatusTooManyRequests {
+			return // got the expected 429
+		}
+	}
+	t.Errorf("last status = %d; expected at least one 429 after exhausting burst", lastCode)
+}
+
+// TestRateLimit_Disabled verifies that no rate limiting occurs when RPS is 0.
+func TestRateLimit_Disabled(t *testing.T) {
+	router := newOpsRouter(t, chihttp.OpsConfig{RateLimitRPS: 0})
+	for i := 0; i < 50; i++ {
+		req, _ := http.NewRequest(http.MethodGet, "/healthz", nil)
+		req.RemoteAddr = "192.0.2.99:1234"
+		rr := httptest.NewRecorder()
+		router.ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("request %d: status = %d, want 200 with rate limiting disabled", i, rr.Code)
+		}
+	}
+}
+
+// TestRateLimit_DifferentIPsNotThrottled verifies that two distinct IPs have independent limiters.
+func TestRateLimit_DifferentIPsNotThrottled(t *testing.T) {
+	// burst=1 so a second request from the same IP would be throttled,
+	// but a request from a different IP should still succeed.
+	router := newOpsRouter(t, chihttp.OpsConfig{RateLimitRPS: 1, RateLimitBurst: 1})
+
+	for _, ip := range []string{"10.0.0.1", "10.0.0.2", "10.0.0.3"} {
+		req, _ := http.NewRequest(http.MethodGet, "/healthz", nil)
+		req.RemoteAddr = ip + ":8080"
+		rr := httptest.NewRecorder()
+		router.ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Errorf("IP %s: status = %d, want 200 (first request should pass)", ip, rr.Code)
+		}
 	}
 }

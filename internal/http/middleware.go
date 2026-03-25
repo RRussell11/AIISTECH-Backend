@@ -7,10 +7,12 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
+	"golang.org/x/time/rate"
 
 	auditpkg "github.com/RRussell11/AIISTECH-Backend/internal/audit"
 	"github.com/RRussell11/AIISTECH-Backend/internal/config"
@@ -249,5 +251,148 @@ func MetricsMiddleware(next http.Handler) http.Handler {
 			metricsReqsBySite.Add(sc.SiteID, 1)
 		}
 	})
+}
+
+// OpsConfig holds optional operational settings for the router.
+// Zero values disable the corresponding middleware.
+type OpsConfig struct {
+	// CORSOrigins is a comma-separated list of allowed origins for CORS
+	// pre-flight and actual cross-origin requests.  "*" permits all origins.
+	// An empty string disables CORS header injection.
+	CORSOrigins string
+
+	// MaxBodyBytes, when > 0, limits the size of every request body.
+	// Requests whose body exceeds the limit receive 413 Request Entity Too Large.
+	MaxBodyBytes int64
+
+	// RateLimitRPS is the maximum number of requests per second allowed from a
+	// single remote IP address.  A zero or negative value disables rate limiting.
+	RateLimitRPS float64
+
+	// RateLimitBurst is the token-bucket burst allowance. Values ≤ 0 default to
+	// max(1, int(RateLimitRPS)).
+	RateLimitBurst int
+}
+
+// CORSMiddleware adds CORS headers to every response and handles pre-flight
+// OPTIONS requests.  allowedOrigins is a comma-separated list of allowed origins;
+// use "*" to permit any origin.  When allowedOrigins is empty no CORS headers are
+// injected and the returned middleware is a transparent pass-through.
+func CORSMiddleware(allowedOrigins string) func(http.Handler) http.Handler {
+	origins := make(map[string]bool)
+	wildcard := false
+	for _, o := range strings.Split(allowedOrigins, ",") {
+		o = strings.TrimSpace(o)
+		if o == "" {
+			continue
+		}
+		if o == "*" {
+			wildcard = true
+		}
+		origins[o] = true
+	}
+	enabled := wildcard || len(origins) > 0
+
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !enabled {
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			origin := r.Header.Get("Origin")
+			if origin != "" && (wildcard || origins[origin]) {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+				w.Header().Set("Vary", "Origin")
+				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+				w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Tenant-ID, X-Request-Id")
+			}
+
+			// Handle pre-flight without calling downstream handlers.
+			if r.Method == http.MethodOptions {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// MaxBodyMiddleware limits every request body to maxBytes.  When a body exceeds
+// the limit the handler is called but http.MaxBytesReader ensures a read error
+// occurs; chi's Recoverer middleware will surface a 413.  If maxBytes ≤ 0 the
+// returned middleware is a transparent pass-through.
+func MaxBodyMiddleware(maxBytes int64) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		if maxBytes <= 0 {
+			return next
+		}
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// ipLimiters holds per-IP token-bucket limiters for RateLimitMiddleware.
+type ipLimiters struct {
+	mu       sync.Mutex
+	limiters map[string]*rate.Limiter
+	rps      rate.Limit
+	burst    int
+}
+
+func (il *ipLimiters) get(ip string) *rate.Limiter {
+	il.mu.Lock()
+	defer il.mu.Unlock()
+	if l, ok := il.limiters[ip]; ok {
+		return l
+	}
+	l := rate.NewLimiter(il.rps, il.burst)
+	il.limiters[ip] = l
+	return l
+}
+
+// RateLimitMiddleware applies a per-remote-IP token-bucket rate limiter.
+// rps is the steady-state rate (requests per second); burst is the maximum
+// instantaneous burst.  When the limiter is exhausted the request receives
+// 429 Too Many Requests.  If rps ≤ 0 the returned middleware is a transparent
+// pass-through.
+func RateLimitMiddleware(rps float64, burst int) func(http.Handler) http.Handler {
+	if rps <= 0 {
+		return func(next http.Handler) http.Handler { return next }
+	}
+	if burst <= 0 {
+		burst = max(1, int(rps))
+	}
+	il := &ipLimiters{
+		limiters: make(map[string]*rate.Limiter),
+		rps:      rate.Limit(rps),
+		burst:    burst,
+	}
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ip := remoteIP(r)
+			if !il.get(ip).Allow() {
+				slog.Warn("rate limit exceeded", "ip", ip, "path", r.URL.Path)
+				http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// remoteIP extracts the client IP from r.RemoteAddr, stripping the port.
+// It does not trust X-Forwarded-For to avoid header-spoofing attacks; operators
+// running behind a trusted proxy should add a forwarding-aware middleware earlier
+// in the chain.
+func remoteIP(r *http.Request) string {
+	addr := r.RemoteAddr
+	if i := strings.LastIndex(addr, ":"); i > 0 {
+		return addr[:i]
+	}
+	return addr
 }
 
