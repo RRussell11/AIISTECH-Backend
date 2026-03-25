@@ -661,19 +661,23 @@ func TestLivez(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rr.Code)
 	}
-	var body map[string]string
+	var body map[string]any
 	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
 	if body["status"] != "ok" {
 		t.Errorf("status = %q, want ok", body["status"])
 	}
+	if body["uptime_seconds"] == nil {
+		t.Error("uptime_seconds field should be present")
+	}
 }
 
 func TestReadyz(t *testing.T) {
+	t.Chdir(t.TempDir())
 	rr := do(t, newRouter(t), http.MethodGet, "/healthz/ready", nil)
 	if rr.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", rr.Code)
+		t.Fatalf("status = %d, want 200; body: %s", rr.Code, rr.Body.String())
 	}
 	var body map[string]any
 	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
@@ -684,6 +688,38 @@ func TestReadyz(t *testing.T) {
 	}
 	if body["sites"] == nil {
 		t.Error("sites field should be present")
+	}
+	if body["stores"] == nil {
+		t.Error("stores field should be present")
+	}
+	// Verify each site in the test registry reports "ok" store status.
+	storeMap, ok := body["stores"].(map[string]any)
+	if !ok {
+		t.Fatalf("stores field is not a map: %T", body["stores"])
+	}
+	for siteID, v := range storeMap {
+		if v != "ok" {
+			t.Errorf("stores[%q] = %v, want ok", siteID, v)
+		}
+	}
+}
+
+func TestReadyz_AllSitesReported(t *testing.T) {
+	t.Chdir(t.TempDir())
+	rr := do(t, newRouter(t), http.MethodGet, "/healthz/ready", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	// The test registry has "local" and "staging" — both must appear in stores.
+	storeMap := body["stores"].(map[string]any)
+	for _, want := range []string{"local", "staging"} {
+		if storeMap[want] == nil {
+			t.Errorf("stores map missing entry for site %q", want)
+		}
 	}
 }
 

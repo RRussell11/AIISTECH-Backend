@@ -30,6 +30,13 @@ const (
 	bucketDLQ       = webhooks.DLQBucket
 )
 
+// serverStartTime records when the package was first loaded (effectively
+// process start). It is used by LivezHandler to report process uptime.
+// Setting this at package init rather than explicit server-start wiring is
+// intentional: the difference is sub-second for typical deployments and keeps
+// the implementation zero-configuration.
+var serverStartTime = time.Now()
+
 // HealthzHandler handles GET /healthz (non-site-scoped).
 func HealthzHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
@@ -447,21 +454,53 @@ func GetConfigHandler(w http.ResponseWriter, r *http.Request) {
 // --- Observability ---
 
 // LivezHandler handles GET /healthz/live.
-// Returns 200 OK as long as the process is running.
+// Returns 200 OK as long as the process is running, with the process uptime
+// in seconds since the package was first loaded.
 func LivezHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok"}) //nolint:errcheck
+	json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
+		"status":         "ok",
+		"uptime_seconds": int(time.Since(serverStartTime).Seconds()),
+	})
 }
 
 // ReadyzHandler handles GET /healthz/ready.
-// Returns 200 OK when the site registry is loaded and non-empty.
-func ReadyzHandler(reg *site.Registry) http.HandlerFunc {
+// Returns 200 OK when the site registry is non-empty and every registered
+// site's storage can be opened. Returns 503 Service Unavailable when one or
+// more site stores are inaccessible, along with a per-site status map so that
+// operators can pinpoint which stores are degraded.
+func ReadyzHandler(reg *site.Registry, stores *storage.Registry) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ids := reg.SiteIDs()
+
+		storeStatus := make(map[string]string, len(ids))
+		allOK := true
+		for _, id := range ids {
+			// stores.Open is idempotent: the Registry caches the open handle and
+		// returns it on subsequent calls, so probing does not open extra file
+		// descriptors. A non-nil error means the underlying bbolt file is
+		// inaccessible (bad path, wrong permissions, corrupt file, etc.).
+		if _, err := stores.Open(id); err != nil {
+				storeStatus[id] = "error: " + err.Error()
+				allOK = false
+			} else {
+				storeStatus[id] = "ok"
+			}
+		}
+
+		statusStr := "ok"
+		code := http.StatusOK
+		if !allOK {
+			statusStr = "degraded"
+			code = http.StatusServiceUnavailable
+		}
+
 		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(code)
 		json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
-			"status": "ok",
+			"status": statusStr,
 			"sites":  len(ids),
+			"stores": storeStatus,
 		})
 	}
 }

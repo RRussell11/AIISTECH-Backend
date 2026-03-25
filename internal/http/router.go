@@ -33,7 +33,7 @@ func NewRouter(reg *site.Registry, stores *storage.Registry, disp webhooks.Dispa
 	// Non-site-scoped routes
 	r.Get("/healthz", HealthzHandler)           // backward-compatible liveness
 	r.Get("/healthz/live", LivezHandler)        // explicit liveness probe
-	r.Get("/healthz/ready", ReadyzHandler(reg)) // readiness probe: registry loaded
+	r.Get("/healthz/ready", ReadyzHandler(reg, stores)) // readiness probe: registry + store accessibility
 	r.Get("/metrics", MetricsHandler)
 	r.Get("/version", VersionHandler)
 	r.Get("/sites", ListSitesHandler(reg))
