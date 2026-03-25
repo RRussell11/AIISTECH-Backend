@@ -66,6 +66,14 @@ func NewRouter(reg *site.AtomicRegistry, stores *storage.Registry, disp webhooks
 		r.Get("/webhooks/dlq/{id}", GetDLQHandler)
 		r.Delete("/webhooks/dlq/{id}", DeleteDLQHandler)
 		r.Post("/webhooks/dlq/{id}/replay", ReplayDLQHandler(cfg.ReplayClient))
+
+		// Webhook subscription management — stored locally in the site's bbolt
+		// store; use these routes to register, list, and remove subscriptions
+		// without requiring access to the PhaseMirror-HQ daemon.
+		r.Get("/webhooks/subscriptions", ListSubscriptionsHandler)
+		r.Post("/webhooks/subscriptions", CreateSubscriptionHandler)
+		r.Get("/webhooks/subscriptions/{id}", GetSubscriptionHandler)
+		r.Delete("/webhooks/subscriptions/{id}", DeleteSubscriptionHandler)
 	})
 
 	return r

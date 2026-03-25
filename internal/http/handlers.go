@@ -729,6 +729,171 @@ func ReplayDLQHandler(client *http.Client) http.HandlerFunc {
 	}
 }
 
+// --- Subscription management handlers (Segment 34) ---
+
+// subscriptionInput is the request body accepted by CreateSubscriptionHandler.
+// Enabled defaults to true when omitted from the JSON body.
+type subscriptionInput struct {
+	URL      string   `json:"url"`
+	Service  string   `json:"service"`
+	Events   []string `json:"events"`
+	Secret   string   `json:"secret,omitempty"`
+	TenantID string   `json:"tenant_id,omitempty"`
+	Enabled  *bool    `json:"enabled"` // nil = not provided → defaults to true
+}
+
+// ListSubscriptionsHandler handles GET /sites/{site_id}/webhooks/subscriptions.
+// Returns a paginated JSON array of all locally-stored webhook subscriptions
+// for the current site.
+func ListSubscriptionsHandler(w http.ResponseWriter, r *http.Request) {
+	sc, ok := site.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "site context missing", http.StatusInternalServerError)
+		return
+	}
+	cursor, limit, ok := parsePaginationParams(w, r)
+	if !ok {
+		return
+	}
+
+	keys, nextCursor, err := sc.Store.ListPage(webhooks.SubscriptionsBucket, cursor, limit)
+	if err != nil {
+		slog.Error("subscriptions: list failed", "site_id", sc.SiteID, "error", err)
+		http.Error(w, "failed to list subscriptions", http.StatusInternalServerError)
+		return
+	}
+
+	p := webhooks.NewStoreProvider(sc.Store)
+	subs := make([]webhooks.Subscription, 0, len(keys))
+	for _, key := range keys {
+		sub, err := p.Get(r.Context(), key)
+		if err != nil {
+			slog.Warn("subscriptions: get during list failed", "site_id", sc.SiteID, "key", key, "error", err)
+			continue
+		}
+		subs = append(subs, sub)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
+		"site_id":       sc.SiteID,
+		"subscriptions": subs,
+		"next_cursor":   nextCursor,
+	})
+}
+
+// CreateSubscriptionHandler handles POST /sites/{site_id}/webhooks/subscriptions.
+// Accepts a JSON body with url, service, and events (all required); secret,
+// tenant_id, and enabled are optional. Enabled defaults to true when omitted.
+// Returns 201 with the stored subscription on success.
+func CreateSubscriptionHandler(w http.ResponseWriter, r *http.Request) {
+	sc, ok := site.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "site context missing", http.StatusInternalServerError)
+		return
+	}
+
+	var input subscriptionInput
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		http.Error(w, "request body must be valid JSON", http.StatusBadRequest)
+		return
+	}
+
+	// Validate required fields.
+	var missing []string
+	if input.URL == "" {
+		missing = append(missing, "url")
+	}
+	if input.Service == "" {
+		missing = append(missing, "service")
+	}
+	if len(input.Events) == 0 {
+		missing = append(missing, "events")
+	}
+	if len(missing) > 0 {
+		http.Error(w, "missing required fields: "+strings.Join(missing, ", "), http.StatusBadRequest)
+		return
+	}
+
+	// Default enabled to true when the caller did not specify it.
+	enabled := true
+	if input.Enabled != nil {
+		enabled = *input.Enabled
+	}
+
+	sub := webhooks.Subscription{
+		URL:      input.URL,
+		Service:  input.Service,
+		Events:   input.Events,
+		Secret:   input.Secret,
+		TenantID: input.TenantID,
+		Enabled:  enabled,
+	}
+
+	p := webhooks.NewStoreProvider(sc.Store)
+	created, err := p.Create(r.Context(), sub)
+	if err != nil {
+		slog.Error("subscriptions: create failed", "site_id", sc.SiteID, "error", err)
+		http.Error(w, "failed to create subscription", http.StatusInternalServerError)
+		return
+	}
+	slog.Info("subscription created", "site_id", sc.SiteID, "id", created.ID, "url", created.URL)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(created) //nolint:errcheck
+}
+
+// GetSubscriptionHandler handles GET /sites/{site_id}/webhooks/subscriptions/{id}.
+// Returns a single stored subscription by its ID.
+func GetSubscriptionHandler(w http.ResponseWriter, r *http.Request) {
+	sc, ok := site.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "site context missing", http.StatusInternalServerError)
+		return
+	}
+	id := chi.URLParam(r, "id")
+
+	p := webhooks.NewStoreProvider(sc.Store)
+	sub, err := p.Get(r.Context(), id)
+	if err != nil {
+		if webhooks.IsNotFound(err) {
+			http.Error(w, "subscription not found", http.StatusNotFound)
+			return
+		}
+		slog.Error("subscriptions: get failed", "site_id", sc.SiteID, "id", id, "error", err)
+		http.Error(w, "failed to get subscription", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(sub) //nolint:errcheck
+}
+
+// DeleteSubscriptionHandler handles DELETE /sites/{site_id}/webhooks/subscriptions/{id}.
+// Permanently removes a single stored subscription.
+func DeleteSubscriptionHandler(w http.ResponseWriter, r *http.Request) {
+	sc, ok := site.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "site context missing", http.StatusInternalServerError)
+		return
+	}
+	id := chi.URLParam(r, "id")
+
+	p := webhooks.NewStoreProvider(sc.Store)
+	if err := p.Delete(r.Context(), id); err != nil {
+		if webhooks.IsNotFound(err) {
+			http.Error(w, "subscription not found", http.StatusNotFound)
+			return
+		}
+		slog.Error("subscriptions: delete failed", "site_id", sc.SiteID, "id", id, "error", err)
+		http.Error(w, "failed to delete subscription", http.StatusInternalServerError)
+		return
+	}
+	slog.Info("subscription deleted", "site_id", sc.SiteID, "id", id)
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // --- helpers ---
 
 // readJSONBody reads and validates a JSON request body (max 1 MiB).

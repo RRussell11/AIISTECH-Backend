@@ -1654,3 +1654,209 @@ sites:
 		t.Errorf("after swap: site count = %d, want 2", len(body2.Sites))
 	}
 }
+
+// --- Subscription management ---
+
+func TestSubscriptions_CreateAndList(t *testing.T) {
+	t.Chdir(t.TempDir())
+	router := newRouter(t)
+
+	payload := []byte(`{"url":"https://receiver.example.com/hook","service":"svc","events":["audit.write"]}`)
+	rr := do(t, router, http.MethodPost, "/sites/local/webhooks/subscriptions", payload)
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("POST status = %d, want 201; body: %s", rr.Code, rr.Body.String())
+	}
+
+	var created map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode create response: %v", err)
+	}
+	if created["id"] == "" || created["id"] == nil {
+		t.Error("create response missing id")
+	}
+	// enabled should default to true
+	if created["enabled"] != true {
+		t.Errorf("enabled = %v, want true", created["enabled"])
+	}
+
+	// List should return the subscription.
+	rr2 := do(t, router, http.MethodGet, "/sites/local/webhooks/subscriptions", nil)
+	if rr2.Code != http.StatusOK {
+		t.Fatalf("GET list status = %d, want 200", rr2.Code)
+	}
+	var listBody map[string]any
+	if err := json.Unmarshal(rr2.Body.Bytes(), &listBody); err != nil {
+		t.Fatalf("decode list response: %v", err)
+	}
+	subs, ok := listBody["subscriptions"].([]any)
+	if !ok {
+		t.Fatalf("subscriptions field not an array: %T", listBody["subscriptions"])
+	}
+	if len(subs) != 1 {
+		t.Fatalf("subscriptions count = %d, want 1", len(subs))
+	}
+	if _, hasNC := listBody["next_cursor"]; !hasNC {
+		t.Error("list response missing next_cursor field")
+	}
+}
+
+func TestSubscriptions_Create_MissingURL_Returns400(t *testing.T) {
+	rr := do(t, newRouter(t), http.MethodPost, "/sites/local/webhooks/subscriptions",
+		[]byte(`{"service":"svc","events":["audit.write"]}`))
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestSubscriptions_Create_MissingService_Returns400(t *testing.T) {
+	rr := do(t, newRouter(t), http.MethodPost, "/sites/local/webhooks/subscriptions",
+		[]byte(`{"url":"https://example.com/hook","events":["audit.write"]}`))
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestSubscriptions_Create_EmptyEvents_Returns400(t *testing.T) {
+	rr := do(t, newRouter(t), http.MethodPost, "/sites/local/webhooks/subscriptions",
+		[]byte(`{"url":"https://example.com/hook","service":"svc","events":[]}`))
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestSubscriptions_Create_InvalidJSON_Returns400(t *testing.T) {
+	rr := do(t, newRouter(t), http.MethodPost, "/sites/local/webhooks/subscriptions",
+		[]byte("not json"))
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestSubscriptions_Create_ExplicitlyDisabled(t *testing.T) {
+	t.Chdir(t.TempDir())
+	router := newRouter(t)
+
+	payload := []byte(`{"url":"https://example.com/hook","service":"svc","events":["e"],"enabled":false}`)
+	rr := do(t, router, http.MethodPost, "/sites/local/webhooks/subscriptions", payload)
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("POST status = %d, want 201; body: %s", rr.Code, rr.Body.String())
+	}
+	var created map[string]any
+	json.Unmarshal(rr.Body.Bytes(), &created) //nolint:errcheck
+	if created["enabled"] != false {
+		t.Errorf("enabled = %v, want false", created["enabled"])
+	}
+}
+
+func TestSubscriptions_GetByID(t *testing.T) {
+	t.Chdir(t.TempDir())
+	router := newRouter(t)
+
+	// Create one subscription.
+	rr := do(t, router, http.MethodPost, "/sites/local/webhooks/subscriptions",
+		[]byte(`{"url":"https://example.com/hook","service":"svc","events":["e"]}`))
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("create status = %d", rr.Code)
+	}
+	var created map[string]any
+	json.Unmarshal(rr.Body.Bytes(), &created) //nolint:errcheck
+	id := created["id"].(string)
+
+	// GET by ID should return it.
+	rr2 := do(t, router, http.MethodGet, "/sites/local/webhooks/subscriptions/"+id, nil)
+	if rr2.Code != http.StatusOK {
+		t.Fatalf("GET status = %d, want 200; body: %s", rr2.Code, rr2.Body.String())
+	}
+	var got map[string]any
+	json.Unmarshal(rr2.Body.Bytes(), &got) //nolint:errcheck
+	if got["id"] != id {
+		t.Errorf("GET id = %v, want %q", got["id"], id)
+	}
+}
+
+func TestSubscriptions_Get_NotFound(t *testing.T) {
+	rr := do(t, newRouter(t), http.MethodGet, "/sites/local/webhooks/subscriptions/nonexistent.json", nil)
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", rr.Code)
+	}
+}
+
+func TestSubscriptions_Delete_Existing(t *testing.T) {
+	t.Chdir(t.TempDir())
+	router := newRouter(t)
+
+	// Create and then delete.
+	rr := do(t, router, http.MethodPost, "/sites/local/webhooks/subscriptions",
+		[]byte(`{"url":"https://example.com/hook","service":"svc","events":["e"]}`))
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("create status = %d", rr.Code)
+	}
+	var created map[string]any
+	json.Unmarshal(rr.Body.Bytes(), &created) //nolint:errcheck
+	id := created["id"].(string)
+
+	rr2 := do(t, router, http.MethodDelete, "/sites/local/webhooks/subscriptions/"+id, nil)
+	if rr2.Code != http.StatusNoContent {
+		t.Fatalf("DELETE status = %d, want 204; body: %s", rr2.Code, rr2.Body.String())
+	}
+
+	// Subsequent GET should return 404.
+	rr3 := do(t, router, http.MethodGet, "/sites/local/webhooks/subscriptions/"+id, nil)
+	if rr3.Code != http.StatusNotFound {
+		t.Fatalf("GET after delete status = %d, want 404", rr3.Code)
+	}
+}
+
+func TestSubscriptions_Delete_NotFound(t *testing.T) {
+	rr := do(t, newRouter(t), http.MethodDelete, "/sites/local/webhooks/subscriptions/nonexistent.json", nil)
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", rr.Code)
+	}
+}
+
+func TestSubscriptions_ListPagination(t *testing.T) {
+	t.Chdir(t.TempDir())
+	router := newRouter(t)
+
+	// Create 3 subscriptions.
+	for i := range 3 {
+		payload, _ := json.Marshal(map[string]any{
+			"url":     "https://example.com/hook",
+			"service": "svc",
+			"events":  []string{"e"},
+		})
+		rr := do(t, router, http.MethodPost, "/sites/local/webhooks/subscriptions", payload)
+		if rr.Code != http.StatusCreated {
+			t.Fatalf("create #%d status = %d", i, rr.Code)
+		}
+	}
+
+	// Page 1: limit=2.
+	rr := do(t, router, http.MethodGet, "/sites/local/webhooks/subscriptions?limit=2", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("page1 status = %d", rr.Code)
+	}
+	var p1 map[string]any
+	json.Unmarshal(rr.Body.Bytes(), &p1) //nolint:errcheck
+	if len(p1["subscriptions"].([]any)) != 2 {
+		t.Fatalf("page1 count = %d, want 2", len(p1["subscriptions"].([]any)))
+	}
+	cursor := p1["next_cursor"].(string)
+	if cursor == "" {
+		t.Fatal("page1 next_cursor is empty, expected more pages")
+	}
+
+	// Page 2: should have 1 entry with empty next_cursor.
+	rr2 := do(t, router, http.MethodGet, "/sites/local/webhooks/subscriptions?limit=2&cursor="+cursor, nil)
+	if rr2.Code != http.StatusOK {
+		t.Fatalf("page2 status = %d", rr2.Code)
+	}
+	var p2 map[string]any
+	json.Unmarshal(rr2.Body.Bytes(), &p2) //nolint:errcheck
+	if len(p2["subscriptions"].([]any)) != 1 {
+		t.Fatalf("page2 count = %d, want 1", len(p2["subscriptions"].([]any)))
+	}
+	if p2["next_cursor"].(string) != "" {
+		t.Errorf("page2 next_cursor = %q, want empty", p2["next_cursor"])
+	}
+}
