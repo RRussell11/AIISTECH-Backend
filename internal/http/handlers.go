@@ -60,14 +60,17 @@ func PostEventHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	// storageKey is the full tenant-namespaced key used in the store.
+	// key (bare) is returned to the client so it can be used in subsequent GET requests.
+	storageKey := tenantKey(sc.TenantID, key)
 
-	if err := sc.Store.Write(bucketEvents, key, body); err != nil {
-		slog.Error("failed to write event", "site_id", sc.SiteID, "key", key, "error", err)
+	if err := sc.Store.Write(bucketEvents, storageKey, body); err != nil {
+		slog.Error("failed to write event", "site_id", sc.SiteID, "key", storageKey, "error", err)
 		http.Error(w, "failed to write event", http.StatusInternalServerError)
 		return
 	}
 
-	slog.Info("event written", "site_id", sc.SiteID, "key", key)
+	slog.Info("event written", "site_id", sc.SiteID, "key", storageKey)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
@@ -100,12 +103,14 @@ func ListEventsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	cursor, filter, tenantPrefix := applyTenantFilter(sc.TenantID, cursor, filter)
 	keys, nextCursor, err := listFilteredPage(sc.Store, bucketEvents, cursor, limit, filter)
 	if err != nil {
 		slog.Error("failed to list events", "site_id", sc.SiteID, "error", err)
 		http.Error(w, "failed to list events", http.StatusInternalServerError)
 		return
 	}
+	keys, nextCursor = stripTenantPrefix(tenantPrefix, keys, nextCursor)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
@@ -130,7 +135,7 @@ func GetEventHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	data, err := sc.Store.Get(bucketEvents, filename)
+	data, err := sc.Store.Get(bucketEvents, tenantKey(sc.TenantID, filename))
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			http.Error(w, "event not found", http.StatusNotFound)
@@ -191,14 +196,15 @@ func PostArtifactHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	storageKey := tenantKey(sc.TenantID, key)
 
-	if err := sc.Store.Write(bucketArtifacts, key, body); err != nil {
-		slog.Error("failed to write artifact", "site_id", sc.SiteID, "key", key, "error", err)
+	if err := sc.Store.Write(bucketArtifacts, storageKey, body); err != nil {
+		slog.Error("failed to write artifact", "site_id", sc.SiteID, "key", storageKey, "error", err)
 		http.Error(w, "failed to write artifact", http.StatusInternalServerError)
 		return
 	}
 
-	slog.Info("artifact written", "site_id", sc.SiteID, "key", key)
+	slog.Info("artifact written", "site_id", sc.SiteID, "key", storageKey)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
@@ -229,12 +235,14 @@ func ListArtifactsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	cursor, filter, tenantPrefix := applyTenantFilter(sc.TenantID, cursor, filter)
 	keys, nextCursor, err := listFilteredPage(sc.Store, bucketArtifacts, cursor, limit, filter)
 	if err != nil {
 		slog.Error("failed to list artifacts", "site_id", sc.SiteID, "error", err)
 		http.Error(w, "failed to list artifacts", http.StatusInternalServerError)
 		return
 	}
+	keys, nextCursor = stripTenantPrefix(tenantPrefix, keys, nextCursor)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
@@ -258,7 +266,7 @@ func GetArtifactHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	data, err := sc.Store.Get(bucketArtifacts, filename)
+	data, err := sc.Store.Get(bucketArtifacts, tenantKey(sc.TenantID, filename))
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			http.Error(w, "artifact not found", http.StatusNotFound)
@@ -287,7 +295,7 @@ func DeleteArtifactHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := sc.Store.Delete(bucketArtifacts, filename); err != nil {
+	if err := sc.Store.Delete(bucketArtifacts, tenantKey(sc.TenantID, filename)); err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			http.Error(w, "artifact not found", http.StatusNotFound)
 			return
@@ -323,12 +331,14 @@ func ListAuditHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	cursor, filter, tenantPrefix := applyTenantFilter(sc.TenantID, cursor, filter)
 	keys, nextCursor, err := listFilteredPage(sc.Store, bucketAudit, cursor, limit, filter)
 	if err != nil {
 		slog.Error("failed to list audit entries", "site_id", sc.SiteID, "error", err)
 		http.Error(w, "failed to list audit entries", http.StatusInternalServerError)
 		return
 	}
+	keys, nextCursor = stripTenantPrefix(tenantPrefix, keys, nextCursor)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
@@ -353,7 +363,7 @@ func GetAuditHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	data, err := sc.Store.Get(bucketAudit, filename)
+	data, err := sc.Store.Get(bucketAudit, tenantKey(sc.TenantID, filename))
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			http.Error(w, "audit entry not found", http.StatusNotFound)
@@ -604,9 +614,54 @@ func listFilteredPage(store storage.Store, bucket, cursor string, limit int, f l
 	}
 	return out, "", nil
 }
-		
 
+// --- Tenant-scoped storage helpers (Segment 19) ---
 
+// tenantKey prefixes key with the tenant namespace when tenantID is non-empty,
+// ensuring events, artifacts, and audit entries are physically separated per
+// tenant within the same site store bucket.
+// Returns key unchanged when tenantID is empty (legacy mode).
+func tenantKey(tenantID, key string) string {
+	if tenantID == "" {
+		return key
+	}
+	return tenantID + "/" + key
+}
 
+// applyTenantFilter adjusts cursor and filter for tenant-scoped list operations.
+// It returns the storage-level cursor (tenant-prefixed when non-empty), the
+// updated filter with the tenant prefix injected, and the tenant prefix string
+// that must be stripped from keys and nextCursor before they are returned to
+// the caller.
+func applyTenantFilter(tenantID, cursor string, f listFilter) (adjustedCursor string, adjustedFilter listFilter, tenantPrefix string) {
+	if tenantID == "" {
+		return cursor, f, ""
+	}
+	prefix := tenantID + "/"
+	// Re-add tenant prefix to the incoming cursor so it matches storage keys.
+	if cursor != "" {
+		cursor = prefix + cursor
+	}
+	// Prepend tenant prefix to any user-supplied prefix filter.
+	if f.Prefix == "" {
+		f.Prefix = prefix
+	} else {
+		f.Prefix = prefix + f.Prefix
+	}
+	return cursor, f, prefix
+}
+
+// stripTenantPrefix removes tenantPrefix from every key in keys and from
+// nextCursor, producing the bare client-visible names without the tenant
+// namespace. When tenantPrefix is empty the slices are returned unchanged.
+func stripTenantPrefix(tenantPrefix string, keys []string, nextCursor string) ([]string, string) {
+	if tenantPrefix == "" {
+		return keys, nextCursor
+	}
+	for i, k := range keys {
+		keys[i] = strings.TrimPrefix(k, tenantPrefix)
+	}
+	return keys, strings.TrimPrefix(nextCursor, tenantPrefix)
+}
 
 

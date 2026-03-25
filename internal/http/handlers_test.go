@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	chihttp "github.com/RRussell11/AIISTECH-Backend/internal/http"
@@ -975,4 +976,130 @@ func TestPagination_ArtifactsAndAuditSupportCursor(t *testing.T) {
 	if len(entries) != 2 {
 		t.Errorf("audit page len = %d, want 2", len(entries))
 	}
+}
+
+// --- Segment 19: Tenant-scoped storage namespacing ---
+
+// doTenant is like do but always includes the tenant credentials for the "acme"
+// tenant configured by newTenantRouter.
+func doTenant(t *testing.T, router http.Handler, method, path string, body []byte) *httptest.ResponseRecorder {
+t.Helper()
+var req *http.Request
+var err error
+if body != nil {
+req, err = http.NewRequest(method, path, bytes.NewReader(body))
+req.Header.Set("Content-Type", "application/json")
+} else {
+req, err = http.NewRequest(method, path, nil)
+}
+if err != nil {
+t.Fatalf("building request: %v", err)
+}
+req.Header.Set("X-Tenant-ID", "acme")
+req.Header.Set("Authorization", "Bearer acme-secret")
+rr := httptest.NewRecorder()
+router.ServeHTTP(rr, req)
+return rr
+}
+
+// TestTenantStorage_PostListGetEvent verifies the full event lifecycle in tenant
+// mode: write, list (bare key returned), get by bare key.
+func TestTenantStorage_PostListGetEvent(t *testing.T) {
+router := newTenantRouter(t)
+
+// POST an event as tenant acme.
+postRR := doTenant(t, router, http.MethodPost, "/sites/local/events", []byte(`{"tenant":"acme"}`))
+if postRR.Code != http.StatusCreated {
+t.Fatalf("POST event: status=%d body=%s", postRR.Code, postRR.Body.String())
+}
+var postBody map[string]string
+json.Unmarshal(postRR.Body.Bytes(), &postBody) //nolint:errcheck
+file := postBody["file"]
+if file == "" {
+t.Fatal("POST event response missing 'file' field")
+}
+// The bare file key returned must not contain a slash (tenant prefix stripped).
+if strings.Contains(file, "/") {
+t.Errorf("POST event 'file' key %q should not contain slash", file)
+}
+
+// LIST events — must return the same bare key.
+listRR := doTenant(t, router, http.MethodGet, "/sites/local/events", nil)
+if listRR.Code != http.StatusOK {
+t.Fatalf("LIST events: status=%d", listRR.Code)
+}
+var listBody map[string]any
+json.Unmarshal(listRR.Body.Bytes(), &listBody) //nolint:errcheck
+events := listBody["events"].([]any)
+if len(events) != 1 {
+t.Fatalf("expected 1 event, got %d: %v", len(events), events)
+}
+if events[0].(string) != file {
+t.Errorf("list key = %q, want %q", events[0], file)
+}
+
+// GET event by the bare key.
+getRR := doTenant(t, router, http.MethodGet, "/sites/local/events/"+file, nil)
+if getRR.Code != http.StatusOK {
+t.Fatalf("GET event: status=%d body=%s", getRR.Code, getRR.Body.String())
+}
+}
+
+// TestTenantStorage_TenantIsolation verifies that tenant acme cannot see globex's events.
+func TestTenantStorage_TenantIsolation(t *testing.T) {
+dir := t.TempDir()
+t.Chdir(dir)
+cfgDir := filepath.Join(dir, "contracts", "sites", "local")
+if err := os.MkdirAll(cfgDir, 0o755); err != nil {
+t.Fatalf("mkdir: %v", err)
+}
+if err := os.WriteFile(filepath.Join(cfgDir, "config.yaml"), []byte(`site_id: local
+tenants:
+  - tenant_id: acme
+    api_key: "acme-secret"
+  - tenant_id: globex
+    api_key: "globex-secret"
+`), 0o600); err != nil {
+t.Fatalf("write config: %v", err)
+}
+stores := storage.NewRegistry()
+t.Cleanup(func() { stores.CloseAll() })
+router := chihttp.NewRouter(makeTestRegistry(t), stores, nil)
+
+// Write an event as acme.
+acmeReq, _ := http.NewRequest(http.MethodPost, "/sites/local/events", bytes.NewReader([]byte(`{"owner":"acme"}`)))
+acmeReq.Header.Set("Content-Type", "application/json")
+acmeReq.Header.Set("X-Tenant-ID", "acme")
+acmeReq.Header.Set("Authorization", "Bearer acme-secret")
+acmePost := httptest.NewRecorder()
+router.ServeHTTP(acmePost, acmeReq)
+if acmePost.Code != http.StatusCreated {
+t.Fatalf("acme POST: status=%d", acmePost.Code)
+}
+
+// List events as globex — must see 0 events (isolation enforced by key prefix).
+globexReq, _ := http.NewRequest(http.MethodGet, "/sites/local/events", nil)
+globexReq.Header.Set("X-Tenant-ID", "globex")
+globexReq.Header.Set("Authorization", "Bearer globex-secret")
+globexList := httptest.NewRecorder()
+router.ServeHTTP(globexList, globexReq)
+if globexList.Code != http.StatusOK {
+t.Fatalf("globex LIST: status=%d", globexList.Code)
+}
+var body map[string]any
+json.Unmarshal(globexList.Body.Bytes(), &body) //nolint:errcheck
+events := body["events"].([]any)
+if len(events) != 0 {
+t.Errorf("globex should see 0 acme events, got %d: %v", len(events), events)
+}
+}
+
+// TestTenantStorage_GetNonexistentReturns404 verifies that GET for a bare key that
+// does not exist in the tenant's namespace returns 404.
+func TestTenantStorage_GetNonexistentReturns404(t *testing.T) {
+router := newTenantRouter(t)
+rr := doTenant(t, router, http.MethodGet, "/sites/local/events/9999999999999999999.json", nil)
+if rr.Code != http.StatusNotFound {
+t.Errorf("status = %d, want 404", rr.Code)
+}
 }

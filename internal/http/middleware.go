@@ -212,6 +212,7 @@ func AuditMiddleware(d webhooks.Dispatcher) func(http.Handler) http.Handler {
 			entry := auditpkg.Entry{
 				RequestID: chimiddleware.GetReqID(r.Context()),
 				SiteID:    sc.SiteID,
+				TenantID:  sc.TenantID,
 				Method:    r.Method,
 				Path:      r.URL.Path,
 				Status:    sr.status,
@@ -224,6 +225,7 @@ func AuditMiddleware(d webhooks.Dispatcher) func(http.Handler) http.Handler {
 			if d != nil {
 				evt := webhooks.Event{
 					ID:        entry.RequestID,
+					TenantID:  sc.TenantID,
 					Type:      "audit.write",
 					CreatedAt: time.Now().UTC(),
 					Data:      entry,

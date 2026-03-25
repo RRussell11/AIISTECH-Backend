@@ -69,6 +69,10 @@ type Event struct {
 	// nanosecond-timestamped key matching the originating audit entry).
 	ID string `json:"id"`
 
+	// TenantID is the tenant that originated the event. Empty when the site
+	// operates in legacy (non-tenant) mode.
+	TenantID string `json:"tenant_id,omitempty"`
+
 	// Type is the event type string (e.g. "audit.write").
 	Type string `json:"type"`
 
