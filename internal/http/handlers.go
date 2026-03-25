@@ -18,6 +18,7 @@ import (
 	"github.com/RRussell11/AIISTECH-Backend/internal/site"
 	"github.com/RRussell11/AIISTECH-Backend/internal/state"
 	"github.com/RRussell11/AIISTECH-Backend/internal/storage"
+	"github.com/RRussell11/AIISTECH-Backend/internal/version"
 )
 
 const (
@@ -30,6 +31,17 @@ const (
 func HealthzHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"}) //nolint:errcheck
+}
+
+// VersionHandler handles GET /version (non-site-scoped).
+// It returns the build-time version metadata injected via -ldflags.
+func VersionHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{ //nolint:errcheck
+		"version":    version.Version,
+		"commit":     version.Commit,
+		"build_time": version.BuildTime,
+	})
 }
 
 // SiteHealthzHandler handles GET /sites/{site_id}/healthz (site-scoped).

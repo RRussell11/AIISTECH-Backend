@@ -25,6 +25,7 @@ func NewRouter(reg *site.Registry, stores *storage.Registry, disp webhooks.Dispa
 	r.Get("/healthz/live", LivezHandler)        // explicit liveness probe
 	r.Get("/healthz/ready", ReadyzHandler(reg)) // readiness probe: registry loaded
 	r.Get("/metrics", MetricsHandler)
+	r.Get("/version", VersionHandler)
 	r.Get("/sites", ListSitesHandler(reg))
 
 	// Site-scoped routes

@@ -13,6 +13,7 @@ import (
 	chihttp "github.com/RRussell11/AIISTECH-Backend/internal/http"
 	"github.com/RRussell11/AIISTECH-Backend/internal/site"
 	"github.com/RRussell11/AIISTECH-Backend/internal/storage"
+	"github.com/RRussell11/AIISTECH-Backend/internal/version"
 )
 
 // makeTestRegistry returns a Registry loaded from a temp file with local+staging.
@@ -75,6 +76,35 @@ func TestHealthz(t *testing.T) {
 	}
 	if body["status"] != "ok" {
 		t.Errorf("status field = %q, want %q", body["status"], "ok")
+	}
+}
+
+// --- GET /version ---
+
+func TestVersion(t *testing.T) {
+	rr := do(t, newRouter(t), http.MethodGet, "/version", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	if ct := rr.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+	var body map[string]string
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	// All three fields must be present.
+	for _, field := range []string{"version", "commit", "build_time"} {
+		if _, ok := body[field]; !ok {
+			t.Errorf("missing field %q in /version response", field)
+		}
+	}
+	// Default values match the package-level vars (no ldflags in tests).
+	if got, want := body["version"], version.Version; got != want {
+		t.Errorf("version = %q, want %q", got, want)
+	}
+	if got, want := body["commit"], version.Commit; got != want {
+		t.Errorf("commit = %q, want %q", got, want)
 	}
 }
 
