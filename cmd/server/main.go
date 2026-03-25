@@ -119,6 +119,9 @@ func main() {
 		// DLQ sink — wired unconditionally so that the GET/DELETE/replay endpoints
 		// work even without a webhook dispatcher configured.
 		DLQ: dlqSink,
+		// LogLevel — the same *slog.LevelVar used at startup so that
+		// PUT /debug/log-level takes effect process-wide immediately.
+		LogLevel: logLevel,
 	}
 	if v := os.Getenv("AIISTECH_MAX_BODY_BYTES"); v != "" {
 		if n, err := strconv.ParseInt(v, 10, 64); err != nil || n <= 0 {

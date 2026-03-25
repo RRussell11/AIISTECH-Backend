@@ -38,6 +38,8 @@ func NewRouter(reg *site.Registry, stores *storage.Registry, disp webhooks.Dispa
 	r.Get("/metrics", MetricsHandler)
 	r.Get("/version", VersionHandler)
 	r.Get("/sites", ListSitesHandler(reg))
+	r.Get("/debug/log-level", LogLevelHandler(cfg.LogLevel))
+	r.Put("/debug/log-level", SetLogLevelHandler(cfg.LogLevel))
 
 	// Site-scoped routes
 	r.Route("/sites/{site_id}", func(r chi.Router) {

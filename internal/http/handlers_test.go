@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"expvar"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -43,6 +44,15 @@ func newRouter(t *testing.T) http.Handler {
 	stores := storage.NewRegistry()
 	t.Cleanup(func() { stores.CloseAll() })
 	return chihttp.NewRouter(makeTestRegistry(t), stores, nil)
+}
+
+// newRouterWithLogLevel returns a router wired with the provided *slog.LevelVar
+// so that the /debug/log-level endpoints are fully functional in tests.
+func newRouterWithLogLevel(t *testing.T, lv *slog.LevelVar) http.Handler {
+	t.Helper()
+	stores := storage.NewRegistry()
+	t.Cleanup(func() { stores.CloseAll() })
+	return chihttp.NewRouter(makeTestRegistry(t), stores, nil, chihttp.OpsConfig{LogLevel: lv})
 }
 
 // do performs an HTTP request against the router and returns the response recorder.
@@ -1353,5 +1363,135 @@ func TestMetrics_SitesTrackedSeparately(t *testing.T) {
 	}
 	if delta := expvarMapInt("events_written_by_site", "staging") - beforeStaging; delta != 2 {
 		t.Errorf("staging delta = %d, want 2", delta)
+	}
+}
+
+// ---- Log-level toggle tests ----
+
+// TestLogLevel_GetUnmanaged verifies that GET /debug/log-level returns INFO and
+// managed=false when no LogLevel was wired (the default newRouter helper).
+func TestLogLevel_GetUnmanaged(t *testing.T) {
+	router := newRouter(t)
+	rr := do(t, router, http.MethodGet, "/debug/log-level", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body["level"] != "INFO" {
+		t.Errorf("level = %q, want %q", body["level"], "INFO")
+	}
+	if body["managed"] != false {
+		t.Errorf("managed = %v, want false", body["managed"])
+	}
+}
+
+// TestLogLevel_PutUnmanaged verifies that PUT /debug/log-level returns 501 when
+// no LogLevel was wired.
+func TestLogLevel_PutUnmanaged(t *testing.T) {
+	router := newRouter(t)
+	rr := do(t, router, http.MethodPut, "/debug/log-level", []byte(`{"level":"DEBUG"}`))
+	if rr.Code != http.StatusNotImplemented {
+		t.Fatalf("status = %d, want 501", rr.Code)
+	}
+}
+
+// TestLogLevel_GetManaged verifies that GET /debug/log-level reflects the current
+// level when a LogLevel var is wired.
+func TestLogLevel_GetManaged(t *testing.T) {
+	lv := new(slog.LevelVar) // defaults to INFO
+	router := newRouterWithLogLevel(t, lv)
+
+	rr := do(t, router, http.MethodGet, "/debug/log-level", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body["level"] != "INFO" {
+		t.Errorf("level = %q, want %q", body["level"], "INFO")
+	}
+	if body["managed"] != true {
+		t.Errorf("managed = %v, want true", body["managed"])
+	}
+}
+
+// TestLogLevel_PutChangesLevel verifies that PUT /debug/log-level updates the
+// slog.LevelVar and returns the new level in the response.
+func TestLogLevel_PutChangesLevel(t *testing.T) {
+	lv := new(slog.LevelVar) // defaults to INFO
+	router := newRouterWithLogLevel(t, lv)
+
+	rr := do(t, router, http.MethodPut, "/debug/log-level", []byte(`{"level":"DEBUG"}`))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+
+	// LevelVar must be updated.
+	if lv.Level() != slog.LevelDebug {
+		t.Errorf("lv.Level() = %v, want DEBUG", lv.Level())
+	}
+
+	// Response body must reflect the new level.
+	var body map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body["level"] != "DEBUG" {
+		t.Errorf("level = %q, want %q", body["level"], "DEBUG")
+	}
+
+	// Subsequent GET must also show the updated level.
+	rr2 := do(t, router, http.MethodGet, "/debug/log-level", nil)
+	var body2 map[string]any
+	if err := json.Unmarshal(rr2.Body.Bytes(), &body2); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body2["level"] != "DEBUG" {
+		t.Errorf("GET after PUT: level = %q, want %q", body2["level"], "DEBUG")
+	}
+}
+
+// TestLogLevel_PutInvalidLevel verifies that an unknown level name returns 400.
+func TestLogLevel_PutInvalidLevel(t *testing.T) {
+	lv := new(slog.LevelVar)
+	router := newRouterWithLogLevel(t, lv)
+
+	rr := do(t, router, http.MethodPut, "/debug/log-level", []byte(`{"level":"VERBOSE"}`))
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rr.Code)
+	}
+	// LevelVar must be unchanged.
+	if lv.Level() != slog.LevelInfo {
+		t.Errorf("lv.Level() mutated on bad request: got %v, want INFO", lv.Level())
+	}
+}
+
+// TestLogLevel_PutCaseInsensitive verifies that level names are case-insensitive.
+func TestLogLevel_PutCaseInsensitive(t *testing.T) {
+	lv := new(slog.LevelVar)
+	router := newRouterWithLogLevel(t, lv)
+
+	rr := do(t, router, http.MethodPut, "/debug/log-level", []byte(`{"level":"warn"}`))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	if lv.Level() != slog.LevelWarn {
+		t.Errorf("lv.Level() = %v, want WARN", lv.Level())
+	}
+}
+
+// TestLogLevel_PutInvalidJSON verifies that malformed JSON in PUT body returns 400.
+func TestLogLevel_PutInvalidJSON(t *testing.T) {
+	lv := new(slog.LevelVar)
+	router := newRouterWithLogLevel(t, lv)
+
+	rr := do(t, router, http.MethodPut, "/debug/log-level", []byte(`not-json`))
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rr.Code)
 	}
 }

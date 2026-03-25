@@ -322,6 +322,12 @@ type OpsConfig struct {
 	// failed webhook payloads. When nil, a default client with a 10 s timeout
 	// is used. Ignored when DLQ is nil.
 	ReplayClient *http.Client
+
+	// LogLevel is the runtime-adjustable slog level variable wired at startup.
+	// When non-nil, GET /debug/log-level returns the current level and
+	// PUT /debug/log-level updates it without a process restart.
+	// When nil, GET still works (returns "INFO") but PUT returns 501.
+	LogLevel *slog.LevelVar
 }
 
 // CORSMiddleware adds CORS headers to every response and handles pre-flight

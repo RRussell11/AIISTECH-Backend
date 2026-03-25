@@ -955,3 +955,68 @@ func validateJSONFields(body []byte, required []string) []string {
 	}
 	return missing
 }
+
+// --- Log-level toggle ---
+
+// LogLevelHandler handles GET /debug/log-level.
+// Returns the current effective slog level and whether it is runtime-managed.
+// When OpsConfig.LogLevel is nil the response reports level "INFO" and
+// managed=false; the level cannot be changed in that configuration.
+func LogLevelHandler(lv *slog.LevelVar) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if lv == nil {
+			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
+				"level":   slog.LevelInfo.String(),
+				"managed": false,
+			})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
+			"level":   lv.Level().String(),
+			"managed": true,
+		})
+	}
+}
+
+// SetLogLevelHandler handles PUT /debug/log-level.
+// Accepts {"level":"DEBUG"} and updates the process-wide slog level at runtime.
+// Returns 501 Not Implemented when OpsConfig.LogLevel is nil.
+// Accepted level strings (case-insensitive): DEBUG, INFO, WARN, ERROR.
+func SetLogLevelHandler(lv *slog.LevelVar) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if lv == nil {
+			http.Error(w, "log level is not runtime-configurable", http.StatusNotImplemented)
+			return
+		}
+
+		body, err := io.ReadAll(io.LimitReader(r.Body, 1024))
+		if err != nil {
+			http.Error(w, "failed to read body", http.StatusBadRequest)
+			return
+		}
+
+		var req struct {
+			Level string `json:"level"`
+		}
+		if err := json.Unmarshal(body, &req); err != nil {
+			http.Error(w, "invalid JSON body", http.StatusBadRequest)
+			return
+		}
+
+		var l slog.Level
+		if err := l.UnmarshalText([]byte(strings.TrimSpace(req.Level))); err != nil {
+			http.Error(w, fmt.Sprintf("unknown log level %q; use DEBUG, INFO, WARN, or ERROR", req.Level), http.StatusBadRequest)
+			return
+		}
+
+		lv.Set(l)
+		slog.Info("log level changed", "level", l.String())
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
+			"level":   lv.Level().String(),
+			"managed": true,
+		})
+	}
+}
