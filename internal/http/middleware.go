@@ -67,7 +67,7 @@ func SiteMiddleware(reg *site.Registry, stores *storage.Registry) func(http.Hand
 				return
 			}
 
-			sc := site.SiteContext{SiteID: siteID, Store: store, APIKey: cfg.APIKey}
+			sc := site.SiteContext{SiteID: siteID, Store: store, APIKey: cfg.APIKey, Config: cfg}
 
 			// Tenant mode: enforce per-tenant credentials on every request.
 			if len(cfg.Tenants) > 0 {

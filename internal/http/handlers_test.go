@@ -1103,3 +1103,100 @@ if rr.Code != http.StatusNotFound {
 t.Errorf("status = %d, want 404", rr.Code)
 }
 }
+
+// --- Segment 20: Event/artifact schema validation ---
+
+// newSchemaRouter creates a router for a site that has event_schema and
+// artifact_schema configured with required fields.
+func newSchemaRouter(t *testing.T) http.Handler {
+t.Helper()
+dir := t.TempDir()
+t.Chdir(dir)
+
+cfgDir := filepath.Join(dir, "contracts", "sites", "local")
+if err := os.MkdirAll(cfgDir, 0o755); err != nil {
+t.Fatalf("mkdir: %v", err)
+}
+if err := os.WriteFile(filepath.Join(cfgDir, "config.yaml"), []byte(`site_id: local
+event_schema:
+  required:
+    - type
+    - source
+artifact_schema:
+  required:
+    - name
+`), 0o600); err != nil {
+t.Fatalf("write config: %v", err)
+}
+
+stores := storage.NewRegistry()
+t.Cleanup(func() { stores.CloseAll() })
+return chihttp.NewRouter(makeTestRegistry(t), stores, nil)
+}
+
+// TestSchemaValidation_EventMissingFields verifies 422 when required event fields are absent.
+func TestSchemaValidation_EventMissingFields(t *testing.T) {
+router := newSchemaRouter(t)
+rr := do(t, router, http.MethodPost, "/sites/local/events", []byte(`{"other":"value"}`))
+if rr.Code != http.StatusUnprocessableEntity {
+t.Fatalf("status = %d, want 422", rr.Code)
+}
+var body map[string]any
+json.Unmarshal(rr.Body.Bytes(), &body) //nolint:errcheck
+if body["error"] != "schema validation failed" {
+t.Errorf("error = %q, want %q", body["error"], "schema validation failed")
+}
+missing, ok := body["missing_fields"].([]any)
+if !ok || len(missing) == 0 {
+t.Error("expected non-empty missing_fields")
+}
+}
+
+// TestSchemaValidation_EventPartialMissing verifies that only truly missing fields are reported.
+func TestSchemaValidation_EventPartialMissing(t *testing.T) {
+router := newSchemaRouter(t)
+// Provide "type" but not "source"
+rr := do(t, router, http.MethodPost, "/sites/local/events", []byte(`{"type":"test"}`))
+if rr.Code != http.StatusUnprocessableEntity {
+t.Fatalf("status = %d, want 422", rr.Code)
+}
+var body map[string]any
+json.Unmarshal(rr.Body.Bytes(), &body) //nolint:errcheck
+missing := body["missing_fields"].([]any)
+if len(missing) != 1 || missing[0].(string) != "source" {
+t.Errorf("missing_fields = %v, want [source]", missing)
+}
+}
+
+// TestSchemaValidation_EventAllFieldsPresent verifies 201 when all required fields are provided.
+func TestSchemaValidation_EventAllFieldsPresent(t *testing.T) {
+router := newSchemaRouter(t)
+rr := do(t, router, http.MethodPost, "/sites/local/events", []byte(`{"type":"audit","source":"backend","extra":"ok"}`))
+if rr.Code != http.StatusCreated {
+t.Fatalf("status = %d, want 201; body: %s", rr.Code, rr.Body.String())
+}
+}
+
+// TestSchemaValidation_ArtifactMissingName verifies 422 when artifact required field absent.
+func TestSchemaValidation_ArtifactMissingName(t *testing.T) {
+router := newSchemaRouter(t)
+rr := do(t, router, http.MethodPost, "/sites/local/artifacts", []byte(`{"version":"1.0"}`))
+if rr.Code != http.StatusUnprocessableEntity {
+t.Fatalf("status = %d, want 422", rr.Code)
+}
+var body map[string]any
+json.Unmarshal(rr.Body.Bytes(), &body) //nolint:errcheck
+if body["error"] != "schema validation failed" {
+t.Errorf("error = %q, want %q", body["error"], "schema validation failed")
+}
+}
+
+// TestSchemaValidation_NoSchemaConfigured verifies no validation happens without config.
+func TestSchemaValidation_NoSchemaConfigured(t *testing.T) {
+// newRouter uses no config file, so EventSchema is nil.
+router := newRouter(t)
+rr := do(t, router, http.MethodPost, "/sites/local/events", []byte(`{}`))
+if rr.Code != http.StatusCreated {
+t.Fatalf("status = %d, want 201 (no schema configured)", rr.Code)
+}
+}

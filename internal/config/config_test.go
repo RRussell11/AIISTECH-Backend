@@ -112,3 +112,58 @@ func TestLoad_NilSettingsNormalizedToEmptyMap(t *testing.T) {
 		t.Error("Settings should not be nil even when absent from file")
 	}
 }
+
+// TestLoad_EventSchema verifies that event_schema.required is parsed correctly.
+func TestLoad_EventSchema(t *testing.T) {
+dir := t.TempDir()
+p := filepath.Join(dir, "config.yaml")
+yaml := `site_id: local
+event_schema:
+  required:
+    - type
+    - source
+artifact_schema:
+  required:
+    - name
+`
+if err := os.WriteFile(p, []byte(yaml), 0o600); err != nil {
+t.Fatalf("WriteFile: %v", err)
+}
+
+cfg, err := config.Load("local", p)
+if err != nil {
+t.Fatalf("Load: %v", err)
+}
+if cfg.EventSchema == nil {
+t.Fatal("EventSchema should not be nil")
+}
+if len(cfg.EventSchema.Required) != 2 {
+t.Errorf("EventSchema.Required len = %d, want 2", len(cfg.EventSchema.Required))
+}
+if cfg.ArtifactSchema == nil {
+t.Fatal("ArtifactSchema should not be nil")
+}
+if cfg.ArtifactSchema.Required[0] != "name" {
+t.Errorf("ArtifactSchema.Required[0] = %q, want %q", cfg.ArtifactSchema.Required[0], "name")
+}
+}
+
+// TestLoad_NoSchema verifies that omitting schemas leaves them nil.
+func TestLoad_NoSchema(t *testing.T) {
+dir := t.TempDir()
+p := filepath.Join(dir, "config.yaml")
+if err := os.WriteFile(p, []byte("site_id: local\n"), 0o600); err != nil {
+t.Fatalf("WriteFile: %v", err)
+}
+
+cfg, err := config.Load("local", p)
+if err != nil {
+t.Fatalf("Load: %v", err)
+}
+if cfg.EventSchema != nil {
+t.Error("EventSchema should be nil when not configured")
+}
+if cfg.ArtifactSchema != nil {
+t.Error("ArtifactSchema should be nil when not configured")
+}
+}

@@ -18,6 +18,15 @@ type TenantConfig struct {
 	APIKey string `yaml:"api_key" json:"-"`
 }
 
+// SchemaConfig defines simple required-field validation rules for a resource
+// type. All named fields must be present as top-level keys in the JSON body;
+// missing fields cause a 422 Unprocessable Entity response.
+type SchemaConfig struct {
+	// Required is the list of top-level JSON field names that must be present
+	// in every POST body for this resource type.
+	Required []string `yaml:"required" json:"required"`
+}
+
 // SiteConfig holds per-site configuration loaded from contracts/sites/<site_id>/config.yaml.
 type SiteConfig struct {
 	SiteID   string            `yaml:"site_id"  json:"site_id"`
@@ -31,6 +40,12 @@ type SiteConfig struct {
 	// to its dedicated API key. All requests must include a matching
 	// X-Tenant-ID header and Authorization: Bearer <tenant_api_key>.
 	Tenants []TenantConfig `yaml:"tenants" json:"tenants"`
+	// EventSchema defines optional required-field validation for POST /events.
+	// When nil, no schema validation is performed.
+	EventSchema *SchemaConfig `yaml:"event_schema" json:"event_schema,omitempty"`
+	// ArtifactSchema defines optional required-field validation for POST /artifacts.
+	// When nil, no schema validation is performed.
+	ArtifactSchema *SchemaConfig `yaml:"artifact_schema" json:"artifact_schema,omitempty"`
 }
 
 // ConfigPath returns the conventional path for a site's config file, relative to CWD.

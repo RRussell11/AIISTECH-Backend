@@ -60,6 +60,20 @@ func PostEventHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+
+	// Schema validation: check required fields when event_schema is configured.
+	if sc.Config.EventSchema != nil && len(sc.Config.EventSchema.Required) > 0 {
+		if missing := validateJSONFields(body, sc.Config.EventSchema.Required); len(missing) > 0 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
+				"error":          "schema validation failed",
+				"missing_fields": missing,
+			})
+			return
+		}
+	}
+
 	// storageKey is the full tenant-namespaced key used in the store.
 	// key (bare) is returned to the client so it can be used in subsequent GET requests.
 	storageKey := tenantKey(sc.TenantID, key)
@@ -196,6 +210,20 @@ func PostArtifactHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+
+	// Schema validation: check required fields when artifact_schema is configured.
+	if sc.Config.ArtifactSchema != nil && len(sc.Config.ArtifactSchema.Required) > 0 {
+		if missing := validateJSONFields(body, sc.Config.ArtifactSchema.Required); len(missing) > 0 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
+				"error":          "schema validation failed",
+				"missing_fields": missing,
+			})
+			return
+		}
+	}
+
 	storageKey := tenantKey(sc.TenantID, key)
 
 	if err := sc.Store.Write(bucketArtifacts, storageKey, body); err != nil {
@@ -664,4 +692,23 @@ func stripTenantPrefix(tenantPrefix string, keys []string, nextCursor string) ([
 	return keys, strings.TrimPrefix(nextCursor, tenantPrefix)
 }
 
+// --- Schema validation helpers (Segment 20) ---
 
+// validateJSONFields checks that every field name in required is present as a
+// top-level key in the JSON object body. It returns the names of any missing
+// fields. A non-object body (array, scalar) returns nil (no missing fields) so
+// that callers fall through to the existing JSON-validity check.
+func validateJSONFields(body []byte, required []string) []string {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(body, &m); err != nil {
+		// Body is not a JSON object — let the caller surface a 400.
+		return nil
+	}
+	var missing []string
+	for _, field := range required {
+		if _, ok := m[field]; !ok {
+			missing = append(missing, field)
+		}
+	}
+	return missing
+}
