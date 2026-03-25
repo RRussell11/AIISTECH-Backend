@@ -50,11 +50,13 @@ func main() {
 	stores := storage.NewRegistry()
 
 	// Webhook dispatcher — optional. Configure via env vars:
-	//   AIISTECH_WEBHOOK_BASE_URL          — PhaseMirror-HQ subscriptions base URL
-	//   AIISTECH_WEBHOOK_TOKEN             — bearer token for subscription API (optional)
-	//   AIISTECH_SERVICE_NAME              — logical service name (default: "aiistech-backend")
-	//   AIISTECH_WEBHOOK_CACHE_TTL_SECONDS — subscription cache TTL in seconds (0 = no cache)
+	//   AIISTECH_WEBHOOK_BASE_URL             — PhaseMirror-HQ subscriptions base URL
+	//   AIISTECH_WEBHOOK_TOKEN                — bearer token for subscription API (optional)
+	//   AIISTECH_SERVICE_NAME                 — logical service name (default: "aiistech-backend")
+	//   AIISTECH_WEBHOOK_CACHE_TTL_SECONDS    — subscription cache TTL in seconds (0 = no cache)
+	//   AIISTECH_WEBHOOK_POLL_INTERVAL_SECONDS — background refresh interval (0 = lazy TTL only)
 	var disp webhooks.Dispatcher
+	var cachingProvider *webhooks.CachingProvider // non-nil only when caching is enabled
 	if webhookBase := os.Getenv("AIISTECH_WEBHOOK_BASE_URL"); webhookBase != "" {
 		serviceName := os.Getenv("AIISTECH_SERVICE_NAME")
 		if serviceName == "" {
@@ -68,8 +70,25 @@ func main() {
 				slog.Warn("invalid AIISTECH_WEBHOOK_CACHE_TTL_SECONDS, subscription caching disabled", "value", ttlStr)
 			} else {
 				ttl := time.Duration(ttlSec) * time.Second
-				provider = webhooks.NewCachingProvider(provider, ttl)
-				slog.Info("webhook subscription caching enabled", "ttl", ttl)
+
+				// Optional background poll interval.
+				var pollInterval time.Duration
+				if piStr := os.Getenv("AIISTECH_WEBHOOK_POLL_INTERVAL_SECONDS"); piStr != "" {
+					if piSec, err := strconv.Atoi(piStr); err != nil || piSec <= 0 {
+						slog.Warn("invalid AIISTECH_WEBHOOK_POLL_INTERVAL_SECONDS, background polling disabled", "value", piStr)
+					} else {
+						pollInterval = time.Duration(piSec) * time.Second
+					}
+				}
+
+				cp := webhooks.NewCachingProvider(provider, ttl, pollInterval)
+				provider = cp
+				cachingProvider = cp
+				if pollInterval > 0 {
+					slog.Info("webhook subscription caching enabled with background polling", "ttl", ttl, "poll_interval", pollInterval)
+				} else {
+					slog.Info("webhook subscription caching enabled", "ttl", ttl)
+				}
 			}
 		}
 
@@ -114,6 +133,9 @@ func main() {
 		os.Exit(1)
 	}
 
+	if cachingProvider != nil {
+		cachingProvider.Close()
+	}
 	if disp != nil {
 		if err := disp.Close(); err != nil {
 			slog.Error("webhook dispatcher close failed", "error", err)
