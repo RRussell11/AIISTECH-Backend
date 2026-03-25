@@ -3,6 +3,7 @@ package site
 import (
 	"fmt"
 	"os"
+	"sync/atomic"
 
 	"gopkg.in/yaml.v3"
 )
@@ -75,3 +76,36 @@ func (r *Registry) SiteIDs() []string {
 	}
 	return ids
 }
+
+// AtomicRegistry is a concurrency-safe wrapper around *Registry that supports
+// atomic hot-swapping of the underlying registry without restarting the server.
+// All middleware and handler closures that capture an *AtomicRegistry will
+// automatically see the new registry after a Store call (e.g. triggered by
+// SIGHUP).
+type AtomicRegistry struct {
+	p atomic.Pointer[Registry]
+}
+
+// NewAtomicRegistry creates an AtomicRegistry initialised with r.
+// r must not be nil.
+func NewAtomicRegistry(r *Registry) *AtomicRegistry {
+	ar := &AtomicRegistry{}
+	ar.p.Store(r)
+	return ar
+}
+
+// Load returns the current *Registry.  The returned pointer is always non-nil.
+func (ar *AtomicRegistry) Load() *Registry { return ar.p.Load() }
+
+// Store atomically replaces the current registry with r.
+// r must not be nil.
+func (ar *AtomicRegistry) Store(r *Registry) { ar.p.Store(r) }
+
+// Contains reports whether siteID exists in the current registry.
+func (ar *AtomicRegistry) Contains(siteID string) bool { return ar.p.Load().Contains(siteID) }
+
+// SiteIDs returns all registered site IDs from the current registry.
+func (ar *AtomicRegistry) SiteIDs() []string { return ar.p.Load().SiteIDs() }
+
+// DefaultSiteID returns the default site ID from the current registry.
+func (ar *AtomicRegistry) DefaultSiteID() string { return ar.p.Load().DefaultSiteID }

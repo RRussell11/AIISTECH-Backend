@@ -16,7 +16,7 @@ import (
 // for every state-mutating request processed by AuditMiddleware.
 // ops is an optional OpsConfig that enables CORS, body-size limiting, and
 // per-IP rate limiting when the respective fields are non-zero.
-func NewRouter(reg *site.Registry, stores *storage.Registry, disp webhooks.Dispatcher, ops ...OpsConfig) http.Handler {
+func NewRouter(reg *site.AtomicRegistry, stores *storage.Registry, disp webhooks.Dispatcher, ops ...OpsConfig) http.Handler {
 	var cfg OpsConfig
 	if len(ops) > 0 {
 		cfg = ops[0]

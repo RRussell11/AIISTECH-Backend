@@ -39,12 +39,15 @@ const dispatchTimeout = 2 * time.Second
 // When the site config has Tenants configured (tenant mode), every request must
 // include a valid X-Tenant-ID header and a matching Authorization: Bearer token.
 // Unknown tenant IDs or missing/mismatched tokens are rejected immediately.
-func SiteMiddleware(reg *site.Registry, stores *storage.Registry) func(http.Handler) http.Handler {
+func SiteMiddleware(reg *site.AtomicRegistry, stores *storage.Registry) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			rawID := chi.URLParam(r, "site_id")
 
-			siteID, err := site.Resolve(rawID, reg)
+			// Load the current registry snapshot for this request. A concurrent
+			// SIGHUP reload will swap the pointer; future requests see the new
+			// registry while in-flight requests continue with the old snapshot.
+			siteID, err := site.Resolve(rawID, reg.Load())
 			if err != nil {
 				slog.Warn("site resolution failed", "raw_site_id", rawID, "error", err)
 				status := http.StatusNotFound

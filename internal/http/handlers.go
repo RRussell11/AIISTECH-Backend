@@ -196,13 +196,13 @@ func GetEventHandler(w http.ResponseWriter, r *http.Request) {
 
 // ListSitesHandler handles GET /sites (non-site-scoped).
 // Returns the full catalog of registered sites and the default site.
-func ListSitesHandler(reg *site.Registry) http.HandlerFunc {
+func ListSitesHandler(reg *site.AtomicRegistry) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ids := reg.SiteIDs()
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
-			"default_site_id": reg.DefaultSiteID,
+			"default_site_id": reg.DefaultSiteID(),
 			"sites":           ids,
 		})
 	}
@@ -478,7 +478,7 @@ func LivezHandler(w http.ResponseWriter, r *http.Request) {
 // site's storage can be opened. Returns 503 Service Unavailable when one or
 // more site stores are inaccessible, along with a per-site status map so that
 // operators can pinpoint which stores are degraded.
-func ReadyzHandler(reg *site.Registry, stores *storage.Registry) http.HandlerFunc {
+func ReadyzHandler(reg *site.AtomicRegistry, stores *storage.Registry) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ids := reg.SiteIDs()
 
@@ -486,10 +486,10 @@ func ReadyzHandler(reg *site.Registry, stores *storage.Registry) http.HandlerFun
 		allOK := true
 		for _, id := range ids {
 			// stores.Open is idempotent: the Registry caches the open handle and
-		// returns it on subsequent calls, so probing does not open extra file
-		// descriptors. A non-nil error means the underlying bbolt file is
-		// inaccessible (bad path, wrong permissions, corrupt file, etc.).
-		if _, err := stores.Open(id); err != nil {
+			// returns it on subsequent calls, so probing does not open extra file
+			// descriptors. A non-nil error means the underlying bbolt file is
+			// inaccessible (bad path, wrong permissions, corrupt file, etc.).
+			if _, err := stores.Open(id); err != nil {
 				storeStatus[id] = "error: " + err.Error()
 				allOK = false
 			} else {

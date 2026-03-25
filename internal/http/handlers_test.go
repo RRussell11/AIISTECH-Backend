@@ -18,8 +18,8 @@ import (
 	"github.com/RRussell11/AIISTECH-Backend/internal/version"
 )
 
-// makeTestRegistry returns a Registry loaded from a temp file with local+staging.
-func makeTestRegistry(t *testing.T) *site.Registry {
+// makeTestRegistry returns an AtomicRegistry loaded from a temp file with local+staging.
+func makeTestRegistry(t *testing.T) *site.AtomicRegistry {
 	t.Helper()
 	dir := t.TempDir()
 	p := filepath.Join(dir, "sites.yaml")
@@ -36,7 +36,7 @@ sites:
 	if err != nil {
 		t.Fatalf("loading registry: %v", err)
 	}
-	return reg
+	return site.NewAtomicRegistry(reg)
 }
 
 func newRouter(t *testing.T) http.Handler {
@@ -1493,5 +1493,130 @@ func TestLogLevel_PutInvalidJSON(t *testing.T) {
 	rr := do(t, router, http.MethodPut, "/debug/log-level", []byte(`not-json`))
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", rr.Code)
+	}
+}
+
+// ---- SIGHUP hot-reload tests ----
+
+// TestHotReload_NewSiteBecomesAccessible verifies that after an AtomicRegistry swap
+// (simulating a SIGHUP reload), requests for the newly added site are served
+// while requests for a removed site return 404.
+func TestHotReload_NewSiteBecomesAccessible(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	// Build an initial AtomicRegistry with only "local".
+	dir := t.TempDir()
+	p := filepath.Join(dir, "sites.yaml")
+	writeYAML := func(content string) {
+		t.Helper()
+		if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+			t.Fatalf("writeYAML: %v", err)
+		}
+	}
+	writeYAML(`
+default_site_id: local
+sites:
+  - site_id: local
+`)
+	reg1, err := site.LoadRegistry(p)
+	if err != nil {
+		t.Fatalf("LoadRegistry: %v", err)
+	}
+	ar := site.NewAtomicRegistry(reg1)
+
+	stores := storage.NewRegistry()
+	t.Cleanup(func() { stores.CloseAll() })
+	router := chihttp.NewRouter(ar, stores, nil)
+
+	// Before swap: "staging" is unknown → 404.
+	rr := do(t, router, http.MethodGet, "/sites/staging/healthz", nil)
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("before swap: status = %d, want 404", rr.Code)
+	}
+
+	// Simulate SIGHUP reload by swapping in a registry that includes "staging".
+	writeYAML(`
+default_site_id: local
+sites:
+  - site_id: local
+  - site_id: staging
+`)
+	reg2, err := site.LoadRegistry(p)
+	if err != nil {
+		t.Fatalf("LoadRegistry after update: %v", err)
+	}
+	ar.Store(reg2)
+
+	// After swap: "staging" is now known → 200.
+	rr2 := do(t, router, http.MethodGet, "/sites/staging/healthz", nil)
+	if rr2.Code != http.StatusOK {
+		t.Fatalf("after swap: status = %d, want 200", rr2.Code)
+	}
+}
+
+// TestHotReload_ListSitesReflectsNewRegistry verifies that GET /sites reflects
+// the latest registry after a hot-swap.
+func TestHotReload_ListSitesReflectsNewRegistry(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	dir := t.TempDir()
+	p := filepath.Join(dir, "sites.yaml")
+
+	if err := os.WriteFile(p, []byte(`
+default_site_id: local
+sites:
+  - site_id: local
+`), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	reg1, err := site.LoadRegistry(p)
+	if err != nil {
+		t.Fatalf("LoadRegistry: %v", err)
+	}
+	ar := site.NewAtomicRegistry(reg1)
+
+	stores := storage.NewRegistry()
+	t.Cleanup(func() { stores.CloseAll() })
+	router := chihttp.NewRouter(ar, stores, nil)
+
+	// Before swap: /sites lists only "local".
+	rr := do(t, router, http.MethodGet, "/sites", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("GET /sites status = %d, want 200", rr.Code)
+	}
+	var body1 struct {
+		Sites []string `json:"sites"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body1); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(body1.Sites) != 1 {
+		t.Errorf("before swap: site count = %d, want 1", len(body1.Sites))
+	}
+
+	// Swap in a two-site registry.
+	if err := os.WriteFile(p, []byte(`
+default_site_id: local
+sites:
+  - site_id: local
+  - site_id: staging
+`), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	reg2, err := site.LoadRegistry(p)
+	if err != nil {
+		t.Fatalf("LoadRegistry after update: %v", err)
+	}
+	ar.Store(reg2)
+
+	rr2 := do(t, router, http.MethodGet, "/sites", nil)
+	var body2 struct {
+		Sites []string `json:"sites"`
+	}
+	if err := json.Unmarshal(rr2.Body.Bytes(), &body2); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(body2.Sites) != 2 {
+		t.Errorf("after swap: site count = %d, want 2", len(body2.Sites))
 	}
 }

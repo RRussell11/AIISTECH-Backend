@@ -47,6 +47,10 @@ func main() {
 	}
 	slog.Info("site registry loaded", "default_site_id", reg.DefaultSiteID, "sites", reg.SiteIDs())
 
+	// AtomicRegistry wraps the registry so that a SIGHUP can hot-swap it
+	// without restarting the process or draining in-flight requests.
+	atomicReg := site.NewAtomicRegistry(reg)
+
 	stores := storage.NewRegistry()
 
 	// DLQ sink — always created so that the webhook DLQ HTTP endpoints work
@@ -150,7 +154,7 @@ func main() {
 		slog.Info("CORS enabled", "origins", ops.CORSOrigins)
 	}
 
-	router := sitehttp.NewRouter(reg, stores, disp, ops)
+	router := sitehttp.NewRouter(atomicReg, stores, disp, ops)
 
 	srv := &http.Server{
 		Addr:    addr,
@@ -159,6 +163,24 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	// SIGHUP triggers a hot-reload of the site registry from disk.
+	// In-flight requests continue with the old registry; new requests see the
+	// updated one as soon as Store completes.
+	sighupCh := make(chan os.Signal, 1)
+	signal.Notify(sighupCh, syscall.SIGHUP)
+	go func() {
+		for range sighupCh {
+			slog.Info("SIGHUP received, reloading site registry", "path", registryPath)
+			newReg, err := site.LoadRegistry(registryPath)
+			if err != nil {
+				slog.Error("hot-reload failed: keeping existing registry", "path", registryPath, "error", err)
+				continue
+			}
+			atomicReg.Store(newReg)
+			slog.Info("site registry hot-reloaded", "default_site_id", newReg.DefaultSiteID, "sites", newReg.SiteIDs())
+		}
+	}()
 
 	go func() {
 		slog.Info("starting server", "addr", addr)
