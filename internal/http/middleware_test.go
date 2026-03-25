@@ -3,6 +3,9 @@ package http_test
 import (
 	"context"
 	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 
@@ -170,5 +173,139 @@ func TestAuditMiddleware_DeleteDispatchFired(t *testing.T) {
 	}
 	if len(evts) > 0 && evts[0].Type != "audit.write" {
 		t.Errorf("event Type = %q, want %q", evts[0].Type, "audit.write")
+	}
+}
+
+// --- Tenant mode (SiteMiddleware) ---
+
+// newTenantRouter creates a router for a site that has tenant mode enabled.
+// It writes a config.yaml with two tenants into the temp directory so that
+// SiteMiddleware picks it up.
+func newTenantRouter(t *testing.T) http.Handler {
+	t.Helper()
+	dir := t.TempDir()
+	t.Chdir(dir)
+
+	cfgDir := filepath.Join(dir, "contracts", "sites", "local")
+	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
+		t.Fatalf("mkdir config dir: %v", err)
+	}
+	cfgYAML := `site_id: local
+tenants:
+  - tenant_id: acme
+    api_key: "acme-secret"
+  - tenant_id: globex
+    api_key: "globex-secret"
+`
+	if err := os.WriteFile(filepath.Join(cfgDir, "config.yaml"), []byte(cfgYAML), 0o600); err != nil {
+		t.Fatalf("writing config: %v", err)
+	}
+
+	stores := storage.NewRegistry()
+	t.Cleanup(func() { stores.CloseAll() })
+	return chihttp.NewRouter(makeTestRegistry(t), stores, nil)
+}
+
+// doWithHeaders performs an HTTP request with the given extra headers.
+func doWithHeaders(t *testing.T, router http.Handler, method, path string, headers map[string]string) *httptest.ResponseRecorder {
+	t.Helper()
+	req, err := http.NewRequest(method, path, nil)
+	if err != nil {
+		t.Fatalf("building request: %v", err)
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+	return rr
+}
+
+// TestSiteMiddleware_TenantMode_MissingTenantID returns 400 when X-Tenant-ID is absent.
+func TestSiteMiddleware_TenantMode_MissingTenantID(t *testing.T) {
+	rr := doWithHeaders(t, newTenantRouter(t), http.MethodGet, "/sites/local/healthz", map[string]string{
+		"Authorization": "Bearer acme-secret",
+	})
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rr.Code)
+	}
+}
+
+// TestSiteMiddleware_TenantMode_UnknownTenant returns 400 for an unknown X-Tenant-ID.
+func TestSiteMiddleware_TenantMode_UnknownTenant(t *testing.T) {
+	rr := doWithHeaders(t, newTenantRouter(t), http.MethodGet, "/sites/local/healthz", map[string]string{
+		"X-Tenant-ID":   "unknown",
+		"Authorization": "Bearer acme-secret",
+	})
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rr.Code)
+	}
+}
+
+// TestSiteMiddleware_TenantMode_MissingAuth returns 401 when Authorization is absent.
+func TestSiteMiddleware_TenantMode_MissingAuth(t *testing.T) {
+	rr := doWithHeaders(t, newTenantRouter(t), http.MethodGet, "/sites/local/healthz", map[string]string{
+		"X-Tenant-ID": "acme",
+	})
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", rr.Code)
+	}
+	if rr.Header().Get("WWW-Authenticate") == "" {
+		t.Error("expected WWW-Authenticate header on 401")
+	}
+}
+
+// TestSiteMiddleware_TenantMode_WrongToken returns 401 when the bearer token is wrong.
+func TestSiteMiddleware_TenantMode_WrongToken(t *testing.T) {
+	rr := doWithHeaders(t, newTenantRouter(t), http.MethodGet, "/sites/local/healthz", map[string]string{
+		"X-Tenant-ID":   "acme",
+		"Authorization": "Bearer wrong-secret",
+	})
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", rr.Code)
+	}
+}
+
+// TestSiteMiddleware_TenantMode_CrossTenantToken returns 401 when using another tenant's key.
+func TestSiteMiddleware_TenantMode_CrossTenantToken(t *testing.T) {
+	rr := doWithHeaders(t, newTenantRouter(t), http.MethodGet, "/sites/local/healthz", map[string]string{
+		"X-Tenant-ID":   "acme",
+		"Authorization": "Bearer globex-secret",
+	})
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", rr.Code)
+	}
+}
+
+// TestSiteMiddleware_TenantMode_ValidRequest succeeds with correct credentials.
+func TestSiteMiddleware_TenantMode_ValidRequest(t *testing.T) {
+	rr := doWithHeaders(t, newTenantRouter(t), http.MethodGet, "/sites/local/healthz", map[string]string{
+		"X-Tenant-ID":   "acme",
+		"Authorization": "Bearer acme-secret",
+	})
+	if rr.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200; body: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// TestSiteMiddleware_TenantMode_EnforcedOnGET verifies that GET requests require auth in tenant mode.
+func TestSiteMiddleware_TenantMode_EnforcedOnGET(t *testing.T) {
+	rr := doWithHeaders(t, newTenantRouter(t), http.MethodGet, "/sites/local/healthz", nil)
+	if rr.Code == http.StatusOK {
+		t.Error("expected non-200 for unauthenticated GET in tenant mode")
+	}
+}
+
+// TestSiteMiddleware_LegacyMode_GetOpenWithoutAuth verifies that legacy mode
+// (no tenants configured) still allows GET without credentials.
+func TestSiteMiddleware_LegacyMode_GetOpenWithoutAuth(t *testing.T) {
+	t.Chdir(t.TempDir())
+	stores := storage.NewRegistry()
+	t.Cleanup(func() { stores.CloseAll() })
+	router := chihttp.NewRouter(makeTestRegistry(t), stores, nil)
+
+	rr := do(t, router, http.MethodGet, "/sites/local/healthz", nil)
+	if rr.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200; body: %s", rr.Code, rr.Body.String())
 	}
 }

@@ -33,6 +33,10 @@ const dispatchTimeout = 2 * time.Second
 // registry, opens the site's store, loads the per-site config (to obtain the
 // APIKey), and attaches a SiteContext to the request context.
 // Requests with invalid or unknown site IDs are rejected with 400/404.
+//
+// When the site config has Tenants configured (tenant mode), every request must
+// include a valid X-Tenant-ID header and a matching Authorization: Bearer token.
+// Unknown tenant IDs or missing/mismatched tokens are rejected immediately.
 func SiteMiddleware(reg *site.Registry, stores *storage.Registry) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -64,11 +68,45 @@ func SiteMiddleware(reg *site.Registry, stores *storage.Registry) func(http.Hand
 			}
 
 			sc := site.SiteContext{SiteID: siteID, Store: store, APIKey: cfg.APIKey}
+
+			// Tenant mode: enforce per-tenant credentials on every request.
+			if len(cfg.Tenants) > 0 {
+				tenantID := strings.TrimSpace(r.Header.Get("X-Tenant-ID"))
+				if tenantID == "" {
+					http.Error(w, "X-Tenant-ID header required", http.StatusBadRequest)
+					return
+				}
+				tenantKey, found := lookupTenantKey(cfg.Tenants, tenantID)
+				if !found {
+					http.Error(w, "unknown tenant", http.StatusBadRequest)
+					return
+				}
+				token, ok := bearerToken(r)
+				if !ok || token != tenantKey {
+					slog.Warn("tenant authentication failed", "site_id", siteID, "tenant_id", tenantID, "method", r.Method, "path", r.URL.Path)
+					w.Header().Set("WWW-Authenticate", `Bearer realm="aiistech"`)
+					http.Error(w, "unauthorized", http.StatusUnauthorized)
+					return
+				}
+				sc.TenantID = tenantID
+			}
+
 			ctx := site.NewContext(r.Context(), sc)
 			slog.Info("request", "method", r.Method, "path", r.URL.Path, "site_id", siteID)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
+}
+
+// lookupTenantKey returns the APIKey for the given tenantID from the list of
+// configured tenants. Returns ("", false) when the tenant is not found.
+func lookupTenantKey(tenants []config.TenantConfig, tenantID string) (string, bool) {
+	for _, t := range tenants {
+		if t.TenantID == tenantID {
+			return t.APIKey, true
+		}
+	}
+	return "", false
 }
 
 // AuthMiddleware enforces per-site API-key authentication for state-mutating
