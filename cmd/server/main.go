@@ -60,12 +60,53 @@ func main() {
 	// Webhook dispatcher — optional. Configure via env vars:
 	//   AIISTECH_WEBHOOK_BASE_URL             — PhaseMirror-HQ subscriptions base URL
 	//   AIISTECH_WEBHOOK_TOKEN                — bearer token for subscription API (optional)
+	//   AIISTECH_WEBHOOK_STORE_PROVIDER       — "true" to use locally-stored subscriptions
 	//   AIISTECH_SERVICE_NAME                 — logical service name (default: "aiistech-backend")
 	//   AIISTECH_WEBHOOK_CACHE_TTL_SECONDS    — subscription cache TTL in seconds (0 = no cache)
 	//   AIISTECH_WEBHOOK_POLL_INTERVAL_SECONDS — background refresh interval (0 = lazy TTL only)
 	var disp webhooks.Dispatcher
 	var cachingProvider *webhooks.CachingProvider // non-nil only when caching is enabled
-	if webhookBase := os.Getenv("AIISTECH_WEBHOOK_BASE_URL"); webhookBase != "" {
+
+	// AIISTECH_WEBHOOK_STORE_PROVIDER=true activates the bbolt-backed dispatcher
+	// (ADR-036).  Subscriptions created/updated via the subscription management
+	// API are used for live delivery; no PhaseMirror-HQ daemon is required.
+	// When this env var is set, the AIISTECH_WEBHOOK_BASE_URL path is skipped.
+	if os.Getenv("AIISTECH_WEBHOOK_STORE_PROVIDER") == "true" {
+		serviceName := os.Getenv("AIISTECH_SERVICE_NAME")
+		if serviceName == "" {
+			serviceName = "aiistech-backend"
+		}
+
+		var circuitBreakerCfg *webhooks.CircuitBreakerConfig
+		if cbThresholdStr := os.Getenv("AIISTECH_WEBHOOK_CB_FAILURE_THRESHOLD"); cbThresholdStr != "" {
+			if cbThreshold, err := strconv.Atoi(cbThresholdStr); err != nil || cbThreshold <= 0 {
+				slog.Warn("invalid AIISTECH_WEBHOOK_CB_FAILURE_THRESHOLD, circuit breaking disabled", "value", cbThresholdStr)
+			} else {
+				cbCfg := webhooks.CircuitBreakerConfig{FailureThreshold: cbThreshold}
+				if cbDurStr := os.Getenv("AIISTECH_WEBHOOK_CB_OPEN_DURATION_SECONDS"); cbDurStr != "" {
+					if cbDurSec, err := strconv.Atoi(cbDurStr); err != nil || cbDurSec <= 0 {
+						slog.Warn("invalid AIISTECH_WEBHOOK_CB_OPEN_DURATION_SECONDS, using default", "value", cbDurStr)
+					} else {
+						cbCfg.OpenDuration = time.Duration(cbDurSec) * time.Second
+					}
+				}
+				circuitBreakerCfg = &cbCfg
+				slog.Info("webhook circuit breaker enabled",
+					"failure_threshold", cbCfg.FailureThreshold,
+					"open_duration", cbCfg.OpenDuration,
+				)
+			}
+		}
+
+		provider := webhooks.NewStoreRegistryProvider(stores)
+		wd := webhooks.NewWorkerDispatcher(webhooks.Config{
+			ServiceName:    serviceName,
+			DLQ:            dlqSink,
+			CircuitBreaker: circuitBreakerCfg,
+		}, provider)
+		disp = wd
+		slog.Info("webhook dispatcher started with store provider (local subscriptions)", "service", serviceName)
+	} else if webhookBase := os.Getenv("AIISTECH_WEBHOOK_BASE_URL"); webhookBase != "" {
 		serviceName := os.Getenv("AIISTECH_SERVICE_NAME")
 		if serviceName == "" {
 			serviceName = "aiistech-backend"

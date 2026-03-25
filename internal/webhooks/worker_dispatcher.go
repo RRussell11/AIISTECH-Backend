@@ -131,6 +131,17 @@ func (d *WorkerDispatcher) process(evt Event) {
 	)
 	defer cancel()
 
+	// Thread the originating site ID so that store-backed providers can route
+	// to the correct per-site bbolt store (StoreRegistryProvider, ADR-036).
+	if evt.SiteID != "" {
+		ctx = WithSiteID(ctx, evt.SiteID)
+	}
+
+	slog.Debug("webhooks: fetching subscriptions",
+		"event_id", evt.ID,
+		"event_type", evt.Type,
+		"site_id", evt.SiteID,
+	)
 	subs, err := d.provider.ListSubscriptions(ctx, d.cfg.ServiceName, evt.Type, evt.TenantID)
 	if err != nil {
 		slog.Error("webhooks: failed to list subscriptions",
