@@ -611,6 +611,40 @@ func TestDeleteArtifact_NotFound(t *testing.T) {
 	}
 }
 
+// --- DELETE /sites/{site_id}/events/{filename} ---
+
+func TestDeleteEvent_Valid(t *testing.T) {
+	t.Chdir(t.TempDir())
+	router := newRouter(t)
+
+	postRR := do(t, router, http.MethodPost, "/sites/local/events", []byte(`{"action":"test"}`))
+	if postRR.Code != http.StatusCreated {
+		t.Fatalf("post event failed: %d", postRR.Code)
+	}
+	var postBody map[string]string
+	json.Unmarshal(postRR.Body.Bytes(), &postBody) //nolint:errcheck
+	filename := postBody["file"]
+
+	delRR := do(t, router, http.MethodDelete, "/sites/local/events/"+filename, nil)
+	if delRR.Code != http.StatusNoContent {
+		t.Fatalf("delete status = %d, want 204; body: %s", delRR.Code, delRR.Body.String())
+	}
+
+	// Verify the event is gone.
+	getRR := do(t, router, http.MethodGet, "/sites/local/events/"+filename, nil)
+	if getRR.Code != http.StatusNotFound {
+		t.Errorf("after delete: status = %d, want 404", getRR.Code)
+	}
+}
+
+func TestDeleteEvent_NotFound(t *testing.T) {
+	t.Chdir(t.TempDir())
+	rr := do(t, newRouter(t), http.MethodDelete, "/sites/local/events/9999999.json", nil)
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", rr.Code)
+	}
+}
+
 // --- GET /sites/{site_id}/config ---
 
 func TestGetConfig_NoFile(t *testing.T) {

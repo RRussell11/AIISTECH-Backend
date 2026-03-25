@@ -194,6 +194,35 @@ func GetEventHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write(data) //nolint:errcheck
 }
 
+// DeleteEventHandler handles DELETE /sites/{site_id}/events/{filename}.
+// Returns 204 No Content on success, 404 when the event does not exist.
+func DeleteEventHandler(w http.ResponseWriter, r *http.Request) {
+	sc, ok := site.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "site context missing", http.StatusInternalServerError)
+		return
+	}
+
+	filename := chi.URLParam(r, "filename")
+	if err := site.Validate(filename); err != nil {
+		http.Error(w, fmt.Sprintf("invalid filename: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	if err := sc.Store.Delete(bucketEvents, tenantKey(sc.TenantID, filename)); err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			http.Error(w, "event not found", http.StatusNotFound)
+			return
+		}
+		slog.Error("failed to delete event", "site_id", sc.SiteID, "key", filename, "error", err)
+		http.Error(w, "failed to delete event", http.StatusInternalServerError)
+		return
+	}
+
+	slog.Info("event deleted", "site_id", sc.SiteID, "key", filename)
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // ListSitesHandler handles GET /sites (non-site-scoped).
 // Returns the full catalog of registered sites and the default site.
 func ListSitesHandler(reg *site.AtomicRegistry) http.HandlerFunc {

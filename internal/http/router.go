@@ -52,6 +52,7 @@ func NewRouter(reg *site.AtomicRegistry, stores *storage.Registry, disp webhooks
 		r.Get("/events", ListEventsHandler)
 		r.Post("/events", PostEventHandler)
 		r.Get("/events/{filename}", GetEventHandler)
+		r.Delete("/events/{filename}", DeleteEventHandler)
 		r.Get("/artifacts", ListArtifactsHandler)
 		r.Post("/artifacts", PostArtifactHandler)
 		r.Get("/artifacts/{filename}", GetArtifactHandler)
