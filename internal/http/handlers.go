@@ -37,6 +37,13 @@ const (
 // the implementation zero-configuration.
 var serverStartTime = time.Now()
 
+var (
+	// metricsEventsWrittenBySite counts successful event writes per site ID.
+	metricsEventsWrittenBySite = expvar.NewMap("events_written_by_site")
+	// metricsArtifactsWrittenBySite counts successful artifact writes per site ID.
+	metricsArtifactsWrittenBySite = expvar.NewMap("artifacts_written_by_site")
+)
+
 // HealthzHandler handles GET /healthz (non-site-scoped).
 func HealthzHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
@@ -105,6 +112,7 @@ func PostEventHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to write event", http.StatusInternalServerError)
 		return
 	}
+	metricsEventsWrittenBySite.Add(sc.SiteID, 1)
 
 	slog.Info("event written", "site_id", sc.SiteID, "key", storageKey)
 
@@ -253,6 +261,7 @@ func PostArtifactHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to write artifact", http.StatusInternalServerError)
 		return
 	}
+	metricsArtifactsWrittenBySite.Add(sc.SiteID, 1)
 
 	slog.Info("artifact written", "site_id", sc.SiteID, "key", storageKey)
 

@@ -3,6 +3,7 @@ package http_test
 import (
 	"bytes"
 	"encoding/json"
+	"expvar"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1264,5 +1265,93 @@ func TestSchemaValidation_NoSchemaConfigured(t *testing.T) {
 	rr := do(t, router, http.MethodPost, "/sites/local/events", []byte(`{}`))
 	if rr.Code != http.StatusCreated {
 		t.Fatalf("status = %d, want 201 (no schema configured)", rr.Code)
+	}
+}
+
+// ---- Metrics (expvar) tests ----
+
+// expvarMapInt reads the int64 value for key from the named expvar.Map.
+// Returns 0 when the map or key has not yet been created.
+func expvarMapInt(mapName, key string) int64 {
+	m, _ := expvar.Get(mapName).(*expvar.Map)
+	if m == nil {
+		return 0
+	}
+	v, _ := m.Get(key).(*expvar.Int)
+	if v == nil {
+		return 0
+	}
+	return v.Value()
+}
+
+// TestMetrics_EventWriteIncrementsCounter verifies that a successful POST /events
+// increments events_written_by_site for the target site by exactly 1.
+func TestMetrics_EventWriteIncrementsCounter(t *testing.T) {
+	t.Chdir(t.TempDir())
+	router := newRouter(t)
+
+	before := expvarMapInt("events_written_by_site", "local")
+	rr := do(t, router, http.MethodPost, "/sites/local/events", []byte(`{"x":1}`))
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201", rr.Code)
+	}
+	after := expvarMapInt("events_written_by_site", "local")
+	if after-before != 1 {
+		t.Errorf("events_written_by_site[local] delta = %d, want 1", after-before)
+	}
+}
+
+// TestMetrics_ArtifactWriteIncrementsCounter verifies that a successful POST /artifacts
+// increments artifacts_written_by_site for the target site by exactly 1.
+func TestMetrics_ArtifactWriteIncrementsCounter(t *testing.T) {
+	t.Chdir(t.TempDir())
+	router := newRouter(t)
+
+	before := expvarMapInt("artifacts_written_by_site", "local")
+	rr := do(t, router, http.MethodPost, "/sites/local/artifacts", []byte(`{"k":"v"}`))
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201", rr.Code)
+	}
+	after := expvarMapInt("artifacts_written_by_site", "local")
+	if after-before != 1 {
+		t.Errorf("artifacts_written_by_site[local] delta = %d, want 1", after-before)
+	}
+}
+
+// TestMetrics_EventWriteCounterNotIncrementedOnError verifies that a rejected
+// request (e.g. invalid JSON) does not increment the write counter.
+func TestMetrics_EventWriteCounterNotIncrementedOnError(t *testing.T) {
+	t.Chdir(t.TempDir())
+	router := newRouter(t)
+
+	before := expvarMapInt("events_written_by_site", "local")
+	rr := do(t, router, http.MethodPost, "/sites/local/events", []byte(`not-json`))
+	if rr.Code == http.StatusCreated {
+		t.Fatal("expected non-201 for invalid JSON body")
+	}
+	after := expvarMapInt("events_written_by_site", "local")
+	if after != before {
+		t.Errorf("events_written_by_site[local] changed on error (before=%d after=%d)", before, after)
+	}
+}
+
+// TestMetrics_SitesTrackedSeparately verifies that writes to different sites
+// increment independent counter slots.
+func TestMetrics_SitesTrackedSeparately(t *testing.T) {
+	t.Chdir(t.TempDir())
+	router := newRouter(t)
+
+	beforeLocal := expvarMapInt("events_written_by_site", "local")
+	beforeStaging := expvarMapInt("events_written_by_site", "staging")
+
+	do(t, router, http.MethodPost, "/sites/local/events", []byte(`{"a":1}`))
+	do(t, router, http.MethodPost, "/sites/staging/events", []byte(`{"b":2}`))
+	do(t, router, http.MethodPost, "/sites/staging/events", []byte(`{"c":3}`))
+
+	if delta := expvarMapInt("events_written_by_site", "local") - beforeLocal; delta != 1 {
+		t.Errorf("local delta = %d, want 1", delta)
+	}
+	if delta := expvarMapInt("events_written_by_site", "staging") - beforeStaging; delta != 2 {
+		t.Errorf("staging delta = %d, want 2", delta)
 	}
 }

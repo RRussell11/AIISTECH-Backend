@@ -3,6 +3,7 @@ package webhooks_test
 import (
 	"context"
 	"encoding/json"
+	"expvar"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -427,5 +428,139 @@ func TestWorkerDispatcher_DLQNotCalledOnSuccess(t *testing.T) {
 
 	if len(dlq.records) != 0 {
 		t.Errorf("DLQ got %d records on successful delivery, want 0", len(dlq.records))
+	}
+}
+
+// ---- Metrics (expvar) tests ----
+
+// expvarInt reads the int64 value of the named expvar.Int. Returns 0 when not found.
+func expvarInt(name string) int64 {
+	v, _ := expvar.Get(name).(*expvar.Int)
+	if v == nil {
+		return 0
+	}
+	return v.Value()
+}
+
+// TestWorkerDispatcher_MetricsOnSuccess verifies that a successful delivery
+// increments webhook_deliveries_total and leaves failure counters unchanged.
+func TestWorkerDispatcher_MetricsOnSuccess(t *testing.T) {
+	receiver := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer receiver.Close()
+
+	provider := &staticProvider{subs: []webhooks.Subscription{
+		{ID: "sub-m1", URL: receiver.URL, Enabled: true, Events: []string{"audit.write"}},
+	}}
+	d := webhooks.NewWorkerDispatcher(webhooks.Config{
+		MaxAttempts:  1,
+		WorkerCount:  1,
+		RetryBackoff: noBackoff,
+	}, provider)
+
+	beforeDeliveries := expvarInt("webhook_deliveries_total")
+	beforeFailures := expvarInt("webhook_delivery_failures_total")
+
+	_ = d.Dispatch(context.Background(), webhooks.Event{ID: "evt-m1", Type: "audit.write"})
+	_ = d.Close()
+
+	if delta := expvarInt("webhook_deliveries_total") - beforeDeliveries; delta != 1 {
+		t.Errorf("webhook_deliveries_total delta = %d, want 1", delta)
+	}
+	if delta := expvarInt("webhook_delivery_failures_total") - beforeFailures; delta != 0 {
+		t.Errorf("webhook_delivery_failures_total delta = %d, want 0 on success", delta)
+	}
+}
+
+// TestWorkerDispatcher_MetricsOnFailure verifies that exhausted retries increment
+// webhook_delivery_failures_total and leave deliveries_total unchanged.
+func TestWorkerDispatcher_MetricsOnFailure(t *testing.T) {
+	receiver := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer receiver.Close()
+
+	provider := &staticProvider{subs: []webhooks.Subscription{
+		{ID: "sub-m2", URL: receiver.URL, Enabled: true, Events: []string{"audit.write"}},
+	}}
+	d := webhooks.NewWorkerDispatcher(webhooks.Config{
+		MaxAttempts:  2,
+		WorkerCount:  1,
+		RetryBackoff: noBackoff,
+	}, provider)
+
+	beforeDeliveries := expvarInt("webhook_deliveries_total")
+	beforeFailures := expvarInt("webhook_delivery_failures_total")
+
+	_ = d.Dispatch(context.Background(), webhooks.Event{ID: "evt-m2", Type: "audit.write"})
+	_ = d.Close()
+
+	if delta := expvarInt("webhook_deliveries_total") - beforeDeliveries; delta != 0 {
+		t.Errorf("webhook_deliveries_total delta = %d, want 0 on failure", delta)
+	}
+	if delta := expvarInt("webhook_delivery_failures_total") - beforeFailures; delta != 1 {
+		t.Errorf("webhook_delivery_failures_total delta = %d, want 1", delta)
+	}
+}
+
+// TestWorkerDispatcher_MetricsDLQStored verifies that a DLQ write increments
+// webhook_dlq_stored_total by 1.
+func TestWorkerDispatcher_MetricsDLQStored(t *testing.T) {
+	receiver := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer receiver.Close()
+
+	dlq := &captureDLQ{}
+	provider := &staticProvider{subs: []webhooks.Subscription{
+		{ID: "sub-m3", URL: receiver.URL, Enabled: true, Events: []string{"audit.write"}},
+	}}
+	d := webhooks.NewWorkerDispatcher(webhooks.Config{
+		MaxAttempts:  1,
+		WorkerCount:  1,
+		RetryBackoff: noBackoff,
+		DLQ:          dlq,
+	}, provider)
+
+	beforeDLQ := expvarInt("webhook_dlq_stored_total")
+
+	_ = d.Dispatch(context.Background(), webhooks.Event{ID: "evt-m3", Type: "audit.write"})
+	_ = d.Close()
+
+	if delta := expvarInt("webhook_dlq_stored_total") - beforeDLQ; delta != 1 {
+		t.Errorf("webhook_dlq_stored_total delta = %d, want 1", delta)
+	}
+}
+
+// TestWorkerDispatcher_MetricsDLQNotIncrementedWhenNoDLQ verifies that
+// webhook_dlq_stored_total is not changed when no DLQ is configured.
+func TestWorkerDispatcher_MetricsDLQNotIncrementedWhenNoDLQ(t *testing.T) {
+	receiver := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer receiver.Close()
+
+	provider := &staticProvider{subs: []webhooks.Subscription{
+		{ID: "sub-m4", URL: receiver.URL, Enabled: true, Events: []string{"audit.write"}},
+	}}
+	d := webhooks.NewWorkerDispatcher(webhooks.Config{
+		MaxAttempts:  1,
+		WorkerCount:  1,
+		RetryBackoff: noBackoff,
+		DLQ:          nil,
+	}, provider)
+
+	beforeDLQ := expvarInt("webhook_dlq_stored_total")
+
+	_ = d.Dispatch(context.Background(), webhooks.Event{ID: "evt-m4", Type: "audit.write"})
+	_ = d.Close()
+
+	if delta := expvarInt("webhook_dlq_stored_total") - beforeDLQ; delta != 0 {
+		t.Errorf("webhook_dlq_stored_total delta = %d, want 0 (no DLQ configured)", delta)
 	}
 }

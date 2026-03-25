@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"expvar"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -20,8 +21,20 @@ const (
 
 	// subscriptionFetchTimeoutMultiplier scales the per-delivery timeout up for
 	// the subscription-listing call, which must complete before any delivery
-	// can begin and therefore benefits from a slightly longer budget.
+	// can begin and therefore benefits from a slightly longer budget. The listing
+	// is scoped by service name, event type, and tenant ID.
 	subscriptionFetchTimeoutMultiplier = 2
+)
+
+var (
+	// metricsWebhookDeliveriesTotal counts successful webhook deliveries.
+	metricsWebhookDeliveriesTotal = expvar.NewInt("webhook_deliveries_total")
+	// metricsWebhookDeliveryFailuresTotal counts delivery attempts abandoned after
+	// all retries are exhausted (one increment per subscription that could not
+	// be reached, regardless of whether the event went to the DLQ).
+	metricsWebhookDeliveryFailuresTotal = expvar.NewInt("webhook_delivery_failures_total")
+	// metricsWebhookDLQStoredTotal counts records successfully stored in the DLQ.
+	metricsWebhookDLQStoredTotal = expvar.NewInt("webhook_dlq_stored_total")
 )
 
 // WorkerDispatcher is the concrete Dispatcher implementation. It maintains an
@@ -164,6 +177,7 @@ func (d *WorkerDispatcher) deliverWithRetry(sub Subscription, evt Event, bodyByt
 				"event_id", evt.ID,
 				"attempt", attempt,
 			)
+			metricsWebhookDeliveriesTotal.Add(1)
 			return
 		} else {
 			lastErr = err
@@ -187,6 +201,7 @@ func (d *WorkerDispatcher) deliverWithRetry(sub Subscription, evt Event, bodyByt
 		"max_attempts", d.cfg.MaxAttempts,
 		"error", lastErr,
 	)
+	metricsWebhookDeliveryFailuresTotal.Add(1)
 
 	// Move to DLQ when configured.
 	if d.cfg.DLQ != nil {
@@ -208,6 +223,8 @@ func (d *WorkerDispatcher) deliverWithRetry(sub Subscription, evt Event, bodyByt
 				"event_id", evt.ID,
 				"error", err,
 			)
+		} else {
+			metricsWebhookDLQStoredTotal.Add(1)
 		}
 	}
 }
