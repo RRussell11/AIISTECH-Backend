@@ -983,125 +983,125 @@ func TestPagination_ArtifactsAndAuditSupportCursor(t *testing.T) {
 // doTenant is like do but always includes the tenant credentials for the "acme"
 // tenant configured by newTenantRouter.
 func doTenant(t *testing.T, router http.Handler, method, path string, body []byte) *httptest.ResponseRecorder {
-t.Helper()
-var req *http.Request
-var err error
-if body != nil {
-req, err = http.NewRequest(method, path, bytes.NewReader(body))
-req.Header.Set("Content-Type", "application/json")
-} else {
-req, err = http.NewRequest(method, path, nil)
-}
-if err != nil {
-t.Fatalf("building request: %v", err)
-}
-req.Header.Set("X-Tenant-ID", "acme")
-req.Header.Set("Authorization", "Bearer acme-secret")
-rr := httptest.NewRecorder()
-router.ServeHTTP(rr, req)
-return rr
+	t.Helper()
+	var req *http.Request
+	var err error
+	if body != nil {
+		req, err = http.NewRequest(method, path, bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+	} else {
+		req, err = http.NewRequest(method, path, nil)
+	}
+	if err != nil {
+		t.Fatalf("building request: %v", err)
+	}
+	req.Header.Set("X-Tenant-ID", "acme")
+	req.Header.Set("Authorization", "Bearer acme-secret")
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+	return rr
 }
 
 // TestTenantStorage_PostListGetEvent verifies the full event lifecycle in tenant
 // mode: write, list (bare key returned), get by bare key.
 func TestTenantStorage_PostListGetEvent(t *testing.T) {
-router := newTenantRouter(t)
+	router := newTenantRouter(t)
 
-// POST an event as tenant acme.
-postRR := doTenant(t, router, http.MethodPost, "/sites/local/events", []byte(`{"tenant":"acme"}`))
-if postRR.Code != http.StatusCreated {
-t.Fatalf("POST event: status=%d body=%s", postRR.Code, postRR.Body.String())
-}
-var postBody map[string]string
-json.Unmarshal(postRR.Body.Bytes(), &postBody) //nolint:errcheck
-file := postBody["file"]
-if file == "" {
-t.Fatal("POST event response missing 'file' field")
-}
-// The bare file key returned must not contain a slash (tenant prefix stripped).
-if strings.Contains(file, "/") {
-t.Errorf("POST event 'file' key %q should not contain slash", file)
-}
+	// POST an event as tenant acme.
+	postRR := doTenant(t, router, http.MethodPost, "/sites/local/events", []byte(`{"tenant":"acme"}`))
+	if postRR.Code != http.StatusCreated {
+		t.Fatalf("POST event: status=%d body=%s", postRR.Code, postRR.Body.String())
+	}
+	var postBody map[string]string
+	json.Unmarshal(postRR.Body.Bytes(), &postBody) //nolint:errcheck
+	file := postBody["file"]
+	if file == "" {
+		t.Fatal("POST event response missing 'file' field")
+	}
+	// The bare file key returned must not contain a slash (tenant prefix stripped).
+	if strings.Contains(file, "/") {
+		t.Errorf("POST event 'file' key %q should not contain slash", file)
+	}
 
-// LIST events — must return the same bare key.
-listRR := doTenant(t, router, http.MethodGet, "/sites/local/events", nil)
-if listRR.Code != http.StatusOK {
-t.Fatalf("LIST events: status=%d", listRR.Code)
-}
-var listBody map[string]any
-json.Unmarshal(listRR.Body.Bytes(), &listBody) //nolint:errcheck
-events := listBody["events"].([]any)
-if len(events) != 1 {
-t.Fatalf("expected 1 event, got %d: %v", len(events), events)
-}
-if events[0].(string) != file {
-t.Errorf("list key = %q, want %q", events[0], file)
-}
+	// LIST events — must return the same bare key.
+	listRR := doTenant(t, router, http.MethodGet, "/sites/local/events", nil)
+	if listRR.Code != http.StatusOK {
+		t.Fatalf("LIST events: status=%d", listRR.Code)
+	}
+	var listBody map[string]any
+	json.Unmarshal(listRR.Body.Bytes(), &listBody) //nolint:errcheck
+	events := listBody["events"].([]any)
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d: %v", len(events), events)
+	}
+	if events[0].(string) != file {
+		t.Errorf("list key = %q, want %q", events[0], file)
+	}
 
-// GET event by the bare key.
-getRR := doTenant(t, router, http.MethodGet, "/sites/local/events/"+file, nil)
-if getRR.Code != http.StatusOK {
-t.Fatalf("GET event: status=%d body=%s", getRR.Code, getRR.Body.String())
-}
+	// GET event by the bare key.
+	getRR := doTenant(t, router, http.MethodGet, "/sites/local/events/"+file, nil)
+	if getRR.Code != http.StatusOK {
+		t.Fatalf("GET event: status=%d body=%s", getRR.Code, getRR.Body.String())
+	}
 }
 
 // TestTenantStorage_TenantIsolation verifies that tenant acme cannot see globex's events.
 func TestTenantStorage_TenantIsolation(t *testing.T) {
-dir := t.TempDir()
-t.Chdir(dir)
-cfgDir := filepath.Join(dir, "contracts", "sites", "local")
-if err := os.MkdirAll(cfgDir, 0o755); err != nil {
-t.Fatalf("mkdir: %v", err)
-}
-if err := os.WriteFile(filepath.Join(cfgDir, "config.yaml"), []byte(`site_id: local
+	dir := t.TempDir()
+	t.Chdir(dir)
+	cfgDir := filepath.Join(dir, "contracts", "sites", "local")
+	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cfgDir, "config.yaml"), []byte(`site_id: local
 tenants:
   - tenant_id: acme
     api_key: "acme-secret"
   - tenant_id: globex
     api_key: "globex-secret"
 `), 0o600); err != nil {
-t.Fatalf("write config: %v", err)
-}
-stores := storage.NewRegistry()
-t.Cleanup(func() { stores.CloseAll() })
-router := chihttp.NewRouter(makeTestRegistry(t), stores, nil)
+		t.Fatalf("write config: %v", err)
+	}
+	stores := storage.NewRegistry()
+	t.Cleanup(func() { stores.CloseAll() })
+	router := chihttp.NewRouter(makeTestRegistry(t), stores, nil)
 
-// Write an event as acme.
-acmeReq, _ := http.NewRequest(http.MethodPost, "/sites/local/events", bytes.NewReader([]byte(`{"owner":"acme"}`)))
-acmeReq.Header.Set("Content-Type", "application/json")
-acmeReq.Header.Set("X-Tenant-ID", "acme")
-acmeReq.Header.Set("Authorization", "Bearer acme-secret")
-acmePost := httptest.NewRecorder()
-router.ServeHTTP(acmePost, acmeReq)
-if acmePost.Code != http.StatusCreated {
-t.Fatalf("acme POST: status=%d", acmePost.Code)
-}
+	// Write an event as acme.
+	acmeReq, _ := http.NewRequest(http.MethodPost, "/sites/local/events", bytes.NewReader([]byte(`{"owner":"acme"}`)))
+	acmeReq.Header.Set("Content-Type", "application/json")
+	acmeReq.Header.Set("X-Tenant-ID", "acme")
+	acmeReq.Header.Set("Authorization", "Bearer acme-secret")
+	acmePost := httptest.NewRecorder()
+	router.ServeHTTP(acmePost, acmeReq)
+	if acmePost.Code != http.StatusCreated {
+		t.Fatalf("acme POST: status=%d", acmePost.Code)
+	}
 
-// List events as globex — must see 0 events (isolation enforced by key prefix).
-globexReq, _ := http.NewRequest(http.MethodGet, "/sites/local/events", nil)
-globexReq.Header.Set("X-Tenant-ID", "globex")
-globexReq.Header.Set("Authorization", "Bearer globex-secret")
-globexList := httptest.NewRecorder()
-router.ServeHTTP(globexList, globexReq)
-if globexList.Code != http.StatusOK {
-t.Fatalf("globex LIST: status=%d", globexList.Code)
-}
-var body map[string]any
-json.Unmarshal(globexList.Body.Bytes(), &body) //nolint:errcheck
-events := body["events"].([]any)
-if len(events) != 0 {
-t.Errorf("globex should see 0 acme events, got %d: %v", len(events), events)
-}
+	// List events as globex — must see 0 events (isolation enforced by key prefix).
+	globexReq, _ := http.NewRequest(http.MethodGet, "/sites/local/events", nil)
+	globexReq.Header.Set("X-Tenant-ID", "globex")
+	globexReq.Header.Set("Authorization", "Bearer globex-secret")
+	globexList := httptest.NewRecorder()
+	router.ServeHTTP(globexList, globexReq)
+	if globexList.Code != http.StatusOK {
+		t.Fatalf("globex LIST: status=%d", globexList.Code)
+	}
+	var body map[string]any
+	json.Unmarshal(globexList.Body.Bytes(), &body) //nolint:errcheck
+	events := body["events"].([]any)
+	if len(events) != 0 {
+		t.Errorf("globex should see 0 acme events, got %d: %v", len(events), events)
+	}
 }
 
 // TestTenantStorage_GetNonexistentReturns404 verifies that GET for a bare key that
 // does not exist in the tenant's namespace returns 404.
 func TestTenantStorage_GetNonexistentReturns404(t *testing.T) {
-router := newTenantRouter(t)
-rr := doTenant(t, router, http.MethodGet, "/sites/local/events/9999999999999999999.json", nil)
-if rr.Code != http.StatusNotFound {
-t.Errorf("status = %d, want 404", rr.Code)
-}
+	router := newTenantRouter(t)
+	rr := doTenant(t, router, http.MethodGet, "/sites/local/events/9999999999999999999.json", nil)
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", rr.Code)
+	}
 }
 
 // --- Segment 20: Event/artifact schema validation ---
@@ -1109,15 +1109,15 @@ t.Errorf("status = %d, want 404", rr.Code)
 // newSchemaRouter creates a router for a site that has event_schema and
 // artifact_schema configured with required fields.
 func newSchemaRouter(t *testing.T) http.Handler {
-t.Helper()
-dir := t.TempDir()
-t.Chdir(dir)
+	t.Helper()
+	dir := t.TempDir()
+	t.Chdir(dir)
 
-cfgDir := filepath.Join(dir, "contracts", "sites", "local")
-if err := os.MkdirAll(cfgDir, 0o755); err != nil {
-t.Fatalf("mkdir: %v", err)
-}
-if err := os.WriteFile(filepath.Join(cfgDir, "config.yaml"), []byte(`site_id: local
+	cfgDir := filepath.Join(dir, "contracts", "sites", "local")
+	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cfgDir, "config.yaml"), []byte(`site_id: local
 event_schema:
   required:
     - type
@@ -1126,77 +1126,77 @@ artifact_schema:
   required:
     - name
 `), 0o600); err != nil {
-t.Fatalf("write config: %v", err)
-}
+		t.Fatalf("write config: %v", err)
+	}
 
-stores := storage.NewRegistry()
-t.Cleanup(func() { stores.CloseAll() })
-return chihttp.NewRouter(makeTestRegistry(t), stores, nil)
+	stores := storage.NewRegistry()
+	t.Cleanup(func() { stores.CloseAll() })
+	return chihttp.NewRouter(makeTestRegistry(t), stores, nil)
 }
 
 // TestSchemaValidation_EventMissingFields verifies 422 when required event fields are absent.
 func TestSchemaValidation_EventMissingFields(t *testing.T) {
-router := newSchemaRouter(t)
-rr := do(t, router, http.MethodPost, "/sites/local/events", []byte(`{"other":"value"}`))
-if rr.Code != http.StatusUnprocessableEntity {
-t.Fatalf("status = %d, want 422", rr.Code)
-}
-var body map[string]any
-json.Unmarshal(rr.Body.Bytes(), &body) //nolint:errcheck
-if body["error"] != "schema validation failed" {
-t.Errorf("error = %q, want %q", body["error"], "schema validation failed")
-}
-missing, ok := body["missing_fields"].([]any)
-if !ok || len(missing) == 0 {
-t.Error("expected non-empty missing_fields")
-}
+	router := newSchemaRouter(t)
+	rr := do(t, router, http.MethodPost, "/sites/local/events", []byte(`{"other":"value"}`))
+	if rr.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422", rr.Code)
+	}
+	var body map[string]any
+	json.Unmarshal(rr.Body.Bytes(), &body) //nolint:errcheck
+	if body["error"] != "schema validation failed" {
+		t.Errorf("error = %q, want %q", body["error"], "schema validation failed")
+	}
+	missing, ok := body["missing_fields"].([]any)
+	if !ok || len(missing) == 0 {
+		t.Error("expected non-empty missing_fields")
+	}
 }
 
 // TestSchemaValidation_EventPartialMissing verifies that only truly missing fields are reported.
 func TestSchemaValidation_EventPartialMissing(t *testing.T) {
-router := newSchemaRouter(t)
-// Provide "type" but not "source"
-rr := do(t, router, http.MethodPost, "/sites/local/events", []byte(`{"type":"test"}`))
-if rr.Code != http.StatusUnprocessableEntity {
-t.Fatalf("status = %d, want 422", rr.Code)
-}
-var body map[string]any
-json.Unmarshal(rr.Body.Bytes(), &body) //nolint:errcheck
-missing := body["missing_fields"].([]any)
-if len(missing) != 1 || missing[0].(string) != "source" {
-t.Errorf("missing_fields = %v, want [source]", missing)
-}
+	router := newSchemaRouter(t)
+	// Provide "type" but not "source"
+	rr := do(t, router, http.MethodPost, "/sites/local/events", []byte(`{"type":"test"}`))
+	if rr.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422", rr.Code)
+	}
+	var body map[string]any
+	json.Unmarshal(rr.Body.Bytes(), &body) //nolint:errcheck
+	missing := body["missing_fields"].([]any)
+	if len(missing) != 1 || missing[0].(string) != "source" {
+		t.Errorf("missing_fields = %v, want [source]", missing)
+	}
 }
 
 // TestSchemaValidation_EventAllFieldsPresent verifies 201 when all required fields are provided.
 func TestSchemaValidation_EventAllFieldsPresent(t *testing.T) {
-router := newSchemaRouter(t)
-rr := do(t, router, http.MethodPost, "/sites/local/events", []byte(`{"type":"audit","source":"backend","extra":"ok"}`))
-if rr.Code != http.StatusCreated {
-t.Fatalf("status = %d, want 201; body: %s", rr.Code, rr.Body.String())
-}
+	router := newSchemaRouter(t)
+	rr := do(t, router, http.MethodPost, "/sites/local/events", []byte(`{"type":"audit","source":"backend","extra":"ok"}`))
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body: %s", rr.Code, rr.Body.String())
+	}
 }
 
 // TestSchemaValidation_ArtifactMissingName verifies 422 when artifact required field absent.
 func TestSchemaValidation_ArtifactMissingName(t *testing.T) {
-router := newSchemaRouter(t)
-rr := do(t, router, http.MethodPost, "/sites/local/artifacts", []byte(`{"version":"1.0"}`))
-if rr.Code != http.StatusUnprocessableEntity {
-t.Fatalf("status = %d, want 422", rr.Code)
-}
-var body map[string]any
-json.Unmarshal(rr.Body.Bytes(), &body) //nolint:errcheck
-if body["error"] != "schema validation failed" {
-t.Errorf("error = %q, want %q", body["error"], "schema validation failed")
-}
+	router := newSchemaRouter(t)
+	rr := do(t, router, http.MethodPost, "/sites/local/artifacts", []byte(`{"version":"1.0"}`))
+	if rr.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422", rr.Code)
+	}
+	var body map[string]any
+	json.Unmarshal(rr.Body.Bytes(), &body) //nolint:errcheck
+	if body["error"] != "schema validation failed" {
+		t.Errorf("error = %q, want %q", body["error"], "schema validation failed")
+	}
 }
 
 // TestSchemaValidation_NoSchemaConfigured verifies no validation happens without config.
 func TestSchemaValidation_NoSchemaConfigured(t *testing.T) {
-// newRouter uses no config file, so EventSchema is nil.
-router := newRouter(t)
-rr := do(t, router, http.MethodPost, "/sites/local/events", []byte(`{}`))
-if rr.Code != http.StatusCreated {
-t.Fatalf("status = %d, want 201 (no schema configured)", rr.Code)
-}
+	// newRouter uses no config file, so EventSchema is nil.
+	router := newRouter(t)
+	rr := do(t, router, http.MethodPost, "/sites/local/events", []byte(`{}`))
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (no schema configured)", rr.Code)
+	}
 }

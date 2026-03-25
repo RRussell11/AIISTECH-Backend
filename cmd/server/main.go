@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -49,16 +50,29 @@ func main() {
 	stores := storage.NewRegistry()
 
 	// Webhook dispatcher — optional. Configure via env vars:
-	//   AIISTECH_WEBHOOK_BASE_URL  — PhaseMirror-HQ subscriptions base URL
-	//   AIISTECH_WEBHOOK_TOKEN     — bearer token for subscription API (optional)
-	//   AIISTECH_SERVICE_NAME      — logical service name (default: "aiistech-backend")
+	//   AIISTECH_WEBHOOK_BASE_URL          — PhaseMirror-HQ subscriptions base URL
+	//   AIISTECH_WEBHOOK_TOKEN             — bearer token for subscription API (optional)
+	//   AIISTECH_SERVICE_NAME              — logical service name (default: "aiistech-backend")
+	//   AIISTECH_WEBHOOK_CACHE_TTL_SECONDS — subscription cache TTL in seconds (0 = no cache)
 	var disp webhooks.Dispatcher
 	if webhookBase := os.Getenv("AIISTECH_WEBHOOK_BASE_URL"); webhookBase != "" {
 		serviceName := os.Getenv("AIISTECH_SERVICE_NAME")
 		if serviceName == "" {
 			serviceName = "aiistech-backend"
 		}
-		provider := webhooks.NewRemoteProvider(webhookBase, os.Getenv("AIISTECH_WEBHOOK_TOKEN"), 0)
+		var provider webhooks.Provider = webhooks.NewRemoteProvider(webhookBase, os.Getenv("AIISTECH_WEBHOOK_TOKEN"), 0)
+
+		// Wrap with a caching layer when AIISTECH_WEBHOOK_CACHE_TTL_SECONDS is set.
+		if ttlStr := os.Getenv("AIISTECH_WEBHOOK_CACHE_TTL_SECONDS"); ttlStr != "" {
+			if ttlSec, err := strconv.Atoi(ttlStr); err != nil || ttlSec <= 0 {
+				slog.Warn("invalid AIISTECH_WEBHOOK_CACHE_TTL_SECONDS, subscription caching disabled", "value", ttlStr)
+			} else {
+				ttl := time.Duration(ttlSec) * time.Second
+				provider = webhooks.NewCachingProvider(provider, ttl)
+				slog.Info("webhook subscription caching enabled", "ttl", ttl)
+			}
+		}
+
 		wd := webhooks.NewWorkerDispatcher(webhooks.Config{
 			ServiceName: serviceName,
 		}, provider)
