@@ -73,6 +73,7 @@ func NewRouter(reg *site.AtomicRegistry, stores *storage.Registry, disp webhooks
 		r.Get("/webhooks/subscriptions", ListSubscriptionsHandler)
 		r.Post("/webhooks/subscriptions", CreateSubscriptionHandler)
 		r.Get("/webhooks/subscriptions/{id}", GetSubscriptionHandler)
+		r.Patch("/webhooks/subscriptions/{id}", UpdateSubscriptionHandler)
 		r.Delete("/webhooks/subscriptions/{id}", DeleteSubscriptionHandler)
 	})
 

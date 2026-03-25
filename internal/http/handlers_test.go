@@ -1860,3 +1860,141 @@ func TestSubscriptions_ListPagination(t *testing.T) {
 		t.Errorf("page2 next_cursor = %q, want empty", p2["next_cursor"])
 	}
 }
+
+// --- PATCH /webhooks/subscriptions/{id} ---
+
+func TestSubscriptions_Update_PartialPatch(t *testing.T) {
+t.Chdir(t.TempDir())
+router := newRouter(t)
+
+// Create a subscription.
+createPayload := []byte(`{"url":"https://old.example.com/hook","service":"svc","events":["audit.write"],"enabled":true}`)
+rr := do(t, router, http.MethodPost, "/sites/local/webhooks/subscriptions", createPayload)
+if rr.Code != http.StatusCreated {
+t.Fatalf("create status = %d", rr.Code)
+}
+var created map[string]any
+json.Unmarshal(rr.Body.Bytes(), &created) //nolint:errcheck
+id := created["id"].(string)
+
+// PATCH: change URL only.
+patchPayload := []byte(`{"url":"https://new.example.com/hook"}`)
+rr2 := do(t, router, http.MethodPatch, "/sites/local/webhooks/subscriptions/"+id, patchPayload)
+if rr2.Code != http.StatusOK {
+t.Fatalf("PATCH status = %d, want 200; body: %s", rr2.Code, rr2.Body.String())
+}
+
+var updated map[string]any
+json.Unmarshal(rr2.Body.Bytes(), &updated) //nolint:errcheck
+
+if updated["url"] != "https://new.example.com/hook" {
+t.Errorf("url = %v, want new URL", updated["url"])
+}
+// Other fields must be unchanged.
+if updated["service"] != "svc" {
+t.Errorf("service = %v, want svc", updated["service"])
+}
+if updated["enabled"] != true {
+t.Errorf("enabled = %v, want true", updated["enabled"])
+}
+// ID preserved.
+if updated["id"] != id {
+t.Errorf("id changed: got %v, want %q", updated["id"], id)
+}
+}
+
+func TestSubscriptions_Update_EnableDisable(t *testing.T) {
+t.Chdir(t.TempDir())
+router := newRouter(t)
+
+rr := do(t, router, http.MethodPost, "/sites/local/webhooks/subscriptions",
+[]byte(`{"url":"https://example.com/hook","service":"svc","events":["e"],"enabled":true}`))
+if rr.Code != http.StatusCreated {
+t.Fatalf("create status = %d", rr.Code)
+}
+var created map[string]any
+json.Unmarshal(rr.Body.Bytes(), &created) //nolint:errcheck
+id := created["id"].(string)
+
+// Disable.
+rr2 := do(t, router, http.MethodPatch, "/sites/local/webhooks/subscriptions/"+id,
+[]byte(`{"enabled":false}`))
+if rr2.Code != http.StatusOK {
+t.Fatalf("PATCH disable status = %d; body: %s", rr2.Code, rr2.Body.String())
+}
+var patched map[string]any
+json.Unmarshal(rr2.Body.Bytes(), &patched) //nolint:errcheck
+if patched["enabled"] != false {
+t.Errorf("enabled = %v, want false", patched["enabled"])
+}
+}
+
+func TestSubscriptions_Update_ReplaceEvents(t *testing.T) {
+t.Chdir(t.TempDir())
+router := newRouter(t)
+
+rr := do(t, router, http.MethodPost, "/sites/local/webhooks/subscriptions",
+[]byte(`{"url":"https://example.com/hook","service":"svc","events":["audit.write"]}`))
+if rr.Code != http.StatusCreated {
+t.Fatalf("create status = %d", rr.Code)
+}
+var created map[string]any
+json.Unmarshal(rr.Body.Bytes(), &created) //nolint:errcheck
+id := created["id"].(string)
+
+rr2 := do(t, router, http.MethodPatch, "/sites/local/webhooks/subscriptions/"+id,
+[]byte(`{"events":["artifact.write","event.write"]}`))
+if rr2.Code != http.StatusOK {
+t.Fatalf("PATCH events status = %d; body: %s", rr2.Code, rr2.Body.String())
+}
+var updated map[string]any
+json.Unmarshal(rr2.Body.Bytes(), &updated) //nolint:errcheck
+events, _ := updated["events"].([]any)
+if len(events) != 2 {
+t.Errorf("events len = %d, want 2", len(events))
+}
+}
+
+func TestSubscriptions_Update_NotFound(t *testing.T) {
+rr := do(t, newRouter(t), http.MethodPatch, "/sites/local/webhooks/subscriptions/nonexistent.json",
+[]byte(`{"url":"https://x.example.com/hook"}`))
+if rr.Code != http.StatusNotFound {
+t.Fatalf("status = %d, want 404", rr.Code)
+}
+}
+
+func TestSubscriptions_Update_InvalidJSON(t *testing.T) {
+rr := do(t, newRouter(t), http.MethodPatch, "/sites/local/webhooks/subscriptions/any.json",
+[]byte("not json"))
+if rr.Code != http.StatusBadRequest {
+t.Fatalf("status = %d, want 400", rr.Code)
+}
+}
+
+func TestSubscriptions_Update_Persisted(t *testing.T) {
+t.Chdir(t.TempDir())
+router := newRouter(t)
+
+rr := do(t, router, http.MethodPost, "/sites/local/webhooks/subscriptions",
+[]byte(`{"url":"https://old.example.com/hook","service":"svc","events":["e"]}`))
+if rr.Code != http.StatusCreated {
+t.Fatalf("create status = %d", rr.Code)
+}
+var created map[string]any
+json.Unmarshal(rr.Body.Bytes(), &created) //nolint:errcheck
+id := created["id"].(string)
+
+do(t, router, http.MethodPatch, "/sites/local/webhooks/subscriptions/"+id, //nolint:errcheck
+[]byte(`{"url":"https://updated.example.com/hook"}`))
+
+// Confirm via GET.
+rr3 := do(t, router, http.MethodGet, "/sites/local/webhooks/subscriptions/"+id, nil)
+if rr3.Code != http.StatusOK {
+t.Fatalf("GET after PATCH status = %d", rr3.Code)
+}
+var got map[string]any
+json.Unmarshal(rr3.Body.Bytes(), &got) //nolint:errcheck
+if got["url"] != "https://updated.example.com/hook" {
+t.Errorf("GET after PATCH URL = %v, want updated URL", got["url"])
+}
+}

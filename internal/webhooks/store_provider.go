@@ -120,6 +120,58 @@ func (p *StoreProvider) Delete(_ context.Context, id string) error {
 	return nil
 }
 
+// SubscriptionPatch carries the optional fields accepted by Update.
+// A nil pointer field means "no change"; a non-nil pointer field
+// (or non-empty slice) replaces the existing value.
+type SubscriptionPatch struct {
+	URL      *string   // nil = keep existing
+	Service  *string   // nil = keep existing
+	Events   []string  // nil = keep existing; non-nil (even empty) replaces
+	Secret   *string   // nil = keep existing
+	TenantID *string   // nil = keep existing
+	Enabled  *bool     // nil = keep existing
+}
+
+// Update reads the subscription identified by id, applies the non-nil fields
+// from patch, bumps UpdatedAt, and overwrites the stored record in-place.
+// The ID and CreatedAt are always preserved.
+// Returns storage.ErrNotFound (wrapped) when no such subscription exists.
+func (p *StoreProvider) Update(ctx context.Context, id string, patch SubscriptionPatch) (Subscription, error) {
+	existing, err := p.Get(ctx, id)
+	if err != nil {
+		return Subscription{}, fmt.Errorf("store_provider: update get %q: %w", id, err)
+	}
+
+	if patch.URL != nil {
+		existing.URL = *patch.URL
+	}
+	if patch.Service != nil {
+		existing.Service = *patch.Service
+	}
+	if patch.Events != nil {
+		existing.Events = patch.Events
+	}
+	if patch.Secret != nil {
+		existing.Secret = *patch.Secret
+	}
+	if patch.TenantID != nil {
+		existing.TenantID = *patch.TenantID
+	}
+	if patch.Enabled != nil {
+		existing.Enabled = *patch.Enabled
+	}
+	existing.UpdatedAt = time.Now().UTC()
+
+	data, err := json.Marshal(existing)
+	if err != nil {
+		return Subscription{}, fmt.Errorf("store_provider: update marshal %q: %w", id, err)
+	}
+	if err := p.store.Write(SubscriptionsBucket, id, data); err != nil {
+		return Subscription{}, fmt.Errorf("store_provider: update write %q: %w", id, err)
+	}
+	return existing, nil
+}
+
 // containsEvent reports whether eventType appears in the events slice.
 func containsEvent(events []string, eventType string) bool {
 	for _, e := range events {

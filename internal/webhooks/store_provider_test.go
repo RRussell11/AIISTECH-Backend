@@ -248,3 +248,136 @@ func TestStoreProvider_MultipleCreates_LexicographicOrder(t *testing.T) {
 		}
 	}
 }
+
+func strPtr(s string) *string { return &s }
+func boolPtr(b bool) *bool    { return &b }
+
+func TestStoreProvider_Update_PartialFields(t *testing.T) {
+ctx := context.Background()
+p := newStoreProvider(t)
+
+created, _ := p.Create(ctx, webhooks.Subscription{
+URL:     "https://old.example.com/hook",
+Service: "svc",
+Events:  []string{"audit.write"},
+Enabled: true,
+})
+
+// Patch only URL and Enabled.
+patch := webhooks.SubscriptionPatch{
+URL:     strPtr("https://new.example.com/hook"),
+Enabled: boolPtr(false),
+}
+updated, err := p.Update(ctx, created.ID, patch)
+if err != nil {
+t.Fatalf("Update() error = %v", err)
+}
+
+// Changed fields.
+if updated.URL != "https://new.example.com/hook" {
+t.Errorf("URL = %q, want new URL", updated.URL)
+}
+if updated.Enabled != false {
+t.Errorf("Enabled = %v, want false", updated.Enabled)
+}
+// Unchanged fields preserved.
+if updated.Service != "svc" {
+t.Errorf("Service = %q, want svc", updated.Service)
+}
+if len(updated.Events) != 1 || updated.Events[0] != "audit.write" {
+t.Errorf("Events = %v, want [audit.write]", updated.Events)
+}
+// IDs and CreatedAt must be preserved.
+if updated.ID != created.ID {
+t.Errorf("ID changed: got %q, want %q", updated.ID, created.ID)
+}
+if !updated.CreatedAt.Equal(created.CreatedAt) {
+t.Errorf("CreatedAt changed")
+}
+// UpdatedAt must be after CreatedAt.
+if !updated.UpdatedAt.After(created.UpdatedAt) && !updated.UpdatedAt.Equal(created.UpdatedAt) {
+t.Errorf("UpdatedAt %v not >= CreatedAt %v", updated.UpdatedAt, created.UpdatedAt)
+}
+}
+
+func TestStoreProvider_Update_ReplaceEvents(t *testing.T) {
+ctx := context.Background()
+p := newStoreProvider(t)
+
+created, _ := p.Create(ctx, webhooks.Subscription{
+URL:     "https://example.com/hook",
+Service: "svc",
+Events:  []string{"audit.write"},
+})
+
+updated, err := p.Update(ctx, created.ID, webhooks.SubscriptionPatch{
+Events: []string{"artifact.write", "event.write"},
+})
+if err != nil {
+t.Fatalf("Update() error = %v", err)
+}
+if len(updated.Events) != 2 {
+t.Errorf("Events len = %d, want 2", len(updated.Events))
+}
+}
+
+func TestStoreProvider_Update_Persisted(t *testing.T) {
+ctx := context.Background()
+p := newStoreProvider(t)
+
+created, _ := p.Create(ctx, webhooks.Subscription{
+URL:     "https://example.com/hook",
+Service: "svc",
+Events:  []string{"e"},
+})
+p.Update(ctx, created.ID, webhooks.SubscriptionPatch{URL: strPtr("https://updated.example.com/hook")}) //nolint:errcheck
+
+// Re-fetch to confirm persistence.
+got, err := p.Get(ctx, created.ID)
+if err != nil {
+t.Fatalf("Get() after Update() error = %v", err)
+}
+if got.URL != "https://updated.example.com/hook" {
+t.Errorf("persisted URL = %q, want updated URL", got.URL)
+}
+}
+
+func TestStoreProvider_Update_NotFound(t *testing.T) {
+ctx := context.Background()
+p := newStoreProvider(t)
+
+_, err := p.Update(ctx, "nonexistent.json", webhooks.SubscriptionPatch{URL: strPtr("https://x.example.com/hook")})
+if err == nil {
+t.Fatal("Update() with unknown ID should return an error")
+}
+if !webhooks.IsNotFound(err) {
+t.Errorf("Update() error should wrap storage.ErrNotFound, got %v", err)
+}
+}
+
+func TestStoreProvider_Update_NilPatchChangesNothing(t *testing.T) {
+ctx := context.Background()
+p := newStoreProvider(t)
+
+created, _ := p.Create(ctx, webhooks.Subscription{
+URL:     "https://example.com/hook",
+Service: "svc",
+Events:  []string{"e"},
+Enabled: true,
+})
+
+// Empty patch — nothing should change except UpdatedAt.
+updated, err := p.Update(ctx, created.ID, webhooks.SubscriptionPatch{})
+if err != nil {
+t.Fatalf("Update() error = %v", err)
+}
+if updated.URL != created.URL {
+t.Errorf("URL changed unexpectedly: %q", updated.URL)
+}
+if updated.Service != created.Service {
+t.Errorf("Service changed unexpectedly: %q", updated.Service)
+}
+if updated.Enabled != created.Enabled {
+t.Errorf("Enabled changed unexpectedly: %v", updated.Enabled)
+}
+}

@@ -894,6 +894,62 @@ func DeleteSubscriptionHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// subscriptionPatchInput is the request body accepted by UpdateSubscriptionHandler.
+// All fields are optional; omitted fields leave the existing value unchanged.
+// An explicit null for events replaces the list with an empty slice.
+type subscriptionPatchInput struct {
+	URL      *string  `json:"url"`
+	Service  *string  `json:"service"`
+	Events   []string `json:"events"`    // nil = keep existing; non-nil replaces
+	Secret   *string  `json:"secret"`
+	TenantID *string  `json:"tenant_id"`
+	Enabled  *bool    `json:"enabled"`
+}
+
+// UpdateSubscriptionHandler handles PATCH /sites/{site_id}/webhooks/subscriptions/{id}.
+// Applies a partial update to the stored subscription: only fields present in
+// the request body are changed; all others retain their current values.
+// Returns 200 with the updated subscription on success.
+func UpdateSubscriptionHandler(w http.ResponseWriter, r *http.Request) {
+	sc, ok := site.FromContext(r.Context())
+	if !ok {
+		http.Error(w, "site context missing", http.StatusInternalServerError)
+		return
+	}
+	id := chi.URLParam(r, "id")
+
+	var input subscriptionPatchInput
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		http.Error(w, "request body must be valid JSON", http.StatusBadRequest)
+		return
+	}
+
+	patch := webhooks.SubscriptionPatch{
+		URL:      input.URL,
+		Service:  input.Service,
+		Events:   input.Events,
+		Secret:   input.Secret,
+		TenantID: input.TenantID,
+		Enabled:  input.Enabled,
+	}
+
+	p := webhooks.NewStoreProvider(sc.Store)
+	updated, err := p.Update(r.Context(), id, patch)
+	if err != nil {
+		if webhooks.IsNotFound(err) {
+			http.Error(w, "subscription not found", http.StatusNotFound)
+			return
+		}
+		slog.Error("subscriptions: update failed", "site_id", sc.SiteID, "id", id, "error", err)
+		http.Error(w, "failed to update subscription", http.StatusInternalServerError)
+		return
+	}
+	slog.Info("subscription updated", "site_id", sc.SiteID, "id", id)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(updated) //nolint:errcheck
+}
+
 // --- helpers ---
 
 // readJSONBody reads and validates a JSON request body (max 1 MiB).
