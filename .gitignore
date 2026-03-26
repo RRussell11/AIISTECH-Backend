@@ -6,3 +6,6 @@ var/
 *.exe
 *.test
 *.out
+
+# Local environment — never commit secrets
+.env
