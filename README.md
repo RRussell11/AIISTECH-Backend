@@ -7,6 +7,7 @@ All stateful operations are scoped by an explicit `site_id`.
 
 - [Requirements](#requirements)
 - [Quick Start](#quick-start)
+- [Docker Compose (Production)](#docker-compose-production)
 - [Environment Variables](#environment-variables)
 - [Project Structure](#project-structure)
 - [Site Registry](#site-registry)
@@ -45,6 +46,25 @@ go run ./cmd/server
 ```
 
 The server reads the site registry from `contracts/shared/sites.yaml` on startup and shuts down gracefully on `SIGINT`/`SIGTERM` with a 10-second drain window.
+
+## Docker Compose (Production)
+
+Use Docker Compose to run the backend in production, with the required environment variables wired in via a `.env` file.
+
+```bash
+# 1. Copy the example env file and fill in your values
+cp .env.example .env
+
+# 2. Set the required variables in .env
+#    AIISTECH_WEBHOOK_BASE_URL=https://your-public-url   (no trailing slash)
+#    AIISTECH_WEBHOOK_TOKEN=<openssl rand -hex 32>
+
+# 3. Build and start the service in the background
+docker compose up -d --build
+```
+
+The service listens on port **8080** inside the container, mapped to `8080` on the host.  
+`AIISTECH_WEBHOOK_BASE_URL` and `AIISTECH_WEBHOOK_TOKEN` are required when the backend is linked to PhaseMirror-HQ / the remote provider.
 
 ## Environment Variables
 

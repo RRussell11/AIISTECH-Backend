@@ -1,0 +1,14 @@
+services:
+  aiistech-backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    environment:
+      # Required for PhaseMirror-HQ / remote provider webhook delivery
+      AIISTECH_WEBHOOK_BASE_URL: ${AIISTECH_WEBHOOK_BASE_URL}
+      AIISTECH_WEBHOOK_TOKEN: ${AIISTECH_WEBHOOK_TOKEN}
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
