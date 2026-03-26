@@ -136,7 +136,15 @@ func main() {
 		dlqReplayer = wd
 	}
 
-	router := sitehttp.NewRouter(reg, stores, disp, dlqStore, dlqReplayer, storeProvider)
+	// Admin API key for the DLQ and subscription management endpoints.
+	// When unset those routes are still accessible (backward compat), but a
+	// warning is logged so operators are aware.
+	adminAPIKey := os.Getenv("AIISTECH_ADMIN_API_KEY")
+	if adminAPIKey == "" && (dlqStore != nil || storeProvider != nil) {
+		slog.Warn("AIISTECH_ADMIN_API_KEY is not set; /webhooks/dlq and /webhooks/subscriptions are unauthenticated")
+	}
+
+	router := sitehttp.NewRouter(reg, stores, disp, dlqStore, dlqReplayer, storeProvider, adminAPIKey)
 
 	srv := &http.Server{
 		Addr:    addr,

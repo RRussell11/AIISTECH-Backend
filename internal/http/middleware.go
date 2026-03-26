@@ -2,6 +2,7 @@ package http
 
 import (
 	"context"
+	"crypto/subtle"
 	"expvar"
 	"fmt"
 	"log/slog"
@@ -107,7 +108,7 @@ func AuthMiddleware(next http.Handler) http.Handler {
 		}
 
 		token, ok := bearerToken(r)
-		if !ok || token != sc.APIKey {
+		if !ok || subtle.ConstantTimeCompare([]byte(token), []byte(sc.APIKey)) != 1 {
 			slog.Warn("authentication failed", "site_id", sc.SiteID, "method", r.Method, "path", r.URL.Path)
 			w.Header().Set("WWW-Authenticate", `Bearer realm="aiistech"`)
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -209,5 +210,62 @@ func MetricsMiddleware(next http.Handler) http.Handler {
 			metricsReqsBySite.Add(sc.SiteID, 1)
 		}
 	})
+}
+
+// SecurityHeadersMiddleware sets conservative security-related HTTP response
+// headers on every response.
+func SecurityHeadersMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("X-Frame-Options", "DENY")
+		// Disable the legacy XSS auditor; modern browsers rely on CSP instead.
+		h.Set("X-XSS-Protection", "0")
+		h.Set("Referrer-Policy", "strict-origin-when-cross-origin")
+		next.ServeHTTP(w, r)
+	})
+}
+
+// maxRequestBodyBytes is the default limit enforced by MaxBytesMiddleware.
+const maxRequestBodyBytes int64 = 1 << 20 // 1 MiB
+
+// MaxBytesMiddleware caps incoming request bodies at n bytes using
+// http.MaxBytesReader. Requests whose bodies exceed the limit will cause their
+// handler's body-read (e.g., JSON decode) to return an error; handlers that
+// propagate that error return 400. This prevents unbounded memory consumption
+// from malicious or oversized payloads.
+func MaxBytesMiddleware(n int64) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			r.Body = http.MaxBytesReader(w, r.Body, n)
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// AdminAuthMiddleware guards admin-only routes (DLQ management, subscription
+// management) with a shared API key supplied via the Authorization: Bearer
+// header.  Unlike AuthMiddleware, every HTTP method requires authentication
+// because all admin operations are privileged.
+//
+// When apiKey is empty the middleware is a no-op (all requests pass through).
+// This preserves backward compatibility for deployments that have not yet
+// configured AIISTECH_ADMIN_API_KEY.
+func AdminAuthMiddleware(apiKey string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		if apiKey == "" {
+			return next
+		}
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			token, ok := bearerToken(r)
+			if !ok || subtle.ConstantTimeCompare([]byte(token), []byte(apiKey)) != 1 {
+				slog.Warn("admin authentication failed", "method", r.Method, "path", r.URL.Path)
+				w.Header().Set("WWW-Authenticate", `Bearer realm="aiistech-admin"`)
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
 }
 

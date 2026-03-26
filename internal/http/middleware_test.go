@@ -1,8 +1,12 @@
 package http_test
 
 import (
+	"bytes"
 	"context"
 	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -41,7 +45,7 @@ func newRouterWithDispatcher(t *testing.T, disp webhooks.Dispatcher) http.Handle
 	t.Helper()
 	stores := storage.NewRegistry()
 	t.Cleanup(func() { stores.CloseAll() })
-	return chihttp.NewRouter(makeTestRegistry(t), stores, disp, nil, nil, nil)
+	return chihttp.NewRouter(makeTestRegistry(t), stores, disp, nil, nil, nil, "")
 }
 
 // TestAuditMiddleware_DispatchFiredOnPost verifies that a POST request causes
@@ -170,5 +174,168 @@ func TestAuditMiddleware_DeleteDispatchFired(t *testing.T) {
 	}
 	if len(evts) > 0 && evts[0].Type != "audit.write" {
 		t.Errorf("event Type = %q, want %q", evts[0].Type, "audit.write")
+	}
+}
+
+// --- SecurityHeadersMiddleware ---
+
+// newSecurityRouter builds a minimal router with SecurityHeadersMiddleware wired.
+func newSecurityRouter() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ping", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	return chihttp.SecurityHeadersMiddleware(mux)
+}
+
+func TestSecurityHeadersMiddleware_HeadersPresent(t *testing.T) {
+	router := newSecurityRouter()
+	req := httptest.NewRequest(http.MethodGet, "/ping", nil)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	want := map[string]string{
+		"X-Content-Type-Options": "nosniff",
+		"X-Frame-Options":        "DENY",
+		"X-XSS-Protection":       "0",
+		"Referrer-Policy":        "strict-origin-when-cross-origin",
+	}
+	for header, expected := range want {
+		if got := rr.Header().Get(header); got != expected {
+			t.Errorf("header %s = %q, want %q", header, got, expected)
+		}
+	}
+}
+
+func TestSecurityHeadersMiddleware_ViaRouter(t *testing.T) {
+	// Ensure headers are present on a real router response.
+	router := newRouter(t)
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	if got := rr.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Errorf("X-Content-Type-Options = %q, want nosniff", got)
+	}
+	if got := rr.Header().Get("X-Frame-Options"); got != "DENY" {
+		t.Errorf("X-Frame-Options = %q, want DENY", got)
+	}
+}
+
+// --- MaxBytesMiddleware ---
+
+func TestMaxBytesMiddleware_SmallBodyAllowed(t *testing.T) {
+	t.Chdir(t.TempDir())
+	router := newRouter(t)
+	body := bytes.Repeat([]byte("x"), 512) // well under 1 MiB
+	req := httptest.NewRequest(http.MethodPost, "/sites/local/events", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+	// Body is not valid JSON so expect 400 Bad Request — not 413.
+	if rr.Code == http.StatusRequestEntityTooLarge {
+		t.Fatalf("unexpected 413 for a small body")
+	}
+}
+
+func TestMaxBytesMiddleware_OversizedBodyRejected(t *testing.T) {
+	t.Chdir(t.TempDir())
+	router := newRouter(t)
+	body := bytes.Repeat([]byte("a"), (1<<20)+1) // 1 MiB + 1 byte
+	req := httptest.NewRequest(http.MethodPost, "/sites/local/events", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+	// The handler reads the oversized body via json.Decode, which fails.
+	// The handler should NOT return 200 or 201.
+	if rr.Code == http.StatusOK || rr.Code == http.StatusCreated {
+		t.Fatalf("expected non-2xx for oversized body, got %d", rr.Code)
+	}
+}
+
+// --- AdminAuthMiddleware ---
+
+// openTestDLQRouter builds a router with a DLQ store and the given adminAPIKey.
+func openTestAdminRouter(t *testing.T, adminKey string) http.Handler {
+	t.Helper()
+	s, err := storage.Open(filepath.Join(t.TempDir(), "admin.db"))
+	if err != nil {
+		t.Fatalf("storage.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	sp := webhooks.NewStoreProvider(s)
+	dlqStore := webhooks.NewDLQStore(s)
+	stores := storage.NewRegistry()
+	t.Cleanup(func() { stores.CloseAll() })
+	return chihttp.NewRouter(makeTestRegistry(t), stores, nil, dlqStore, &successReplayer{}, sp, adminKey)
+}
+
+// TestAdminAuthMiddleware_NoKeyAllowsAll verifies that when adminAPIKey is empty
+// all requests reach the handler without any Bearer token.
+func TestAdminAuthMiddleware_NoKeyAllowsAll(t *testing.T) {
+	router := openTestAdminRouter(t, "")
+	req := httptest.NewRequest(http.MethodGet, "/webhooks/subscriptions/", nil)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+	if rr.Code == http.StatusUnauthorized {
+		t.Fatal("expected no auth enforcement when adminAPIKey is empty, got 401")
+	}
+}
+
+// TestAdminAuthMiddleware_WithKeyRejectsNoToken verifies that a request without
+// a Bearer token gets 401 when an admin key is configured.
+func TestAdminAuthMiddleware_WithKeyRejectsNoToken(t *testing.T) {
+	router := openTestAdminRouter(t, "supersecret")
+	for _, path := range []string{
+		"/webhooks/subscriptions/",
+		"/webhooks/dlq/",
+	} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rr := httptest.NewRecorder()
+		router.ServeHTTP(rr, req)
+		if rr.Code != http.StatusUnauthorized {
+			t.Errorf("GET %s without token: status = %d, want 401", path, rr.Code)
+		}
+		if !strings.Contains(rr.Header().Get("WWW-Authenticate"), "Bearer") {
+			t.Errorf("GET %s: missing WWW-Authenticate Bearer challenge", path)
+		}
+	}
+}
+
+// TestAdminAuthMiddleware_WithKeyRejectsWrongToken verifies that a request with
+// a wrong Bearer token gets 401.
+func TestAdminAuthMiddleware_WithKeyRejectsWrongToken(t *testing.T) {
+	router := openTestAdminRouter(t, "supersecret")
+	req := httptest.NewRequest(http.MethodGet, "/webhooks/subscriptions/", nil)
+	req.Header.Set("Authorization", "Bearer wrongtoken")
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", rr.Code)
+	}
+}
+
+// TestAdminAuthMiddleware_WithKeyAcceptsCorrectToken verifies that the correct
+// Bearer token passes the admin auth gate.
+func TestAdminAuthMiddleware_WithKeyAcceptsCorrectToken(t *testing.T) {
+	router := openTestAdminRouter(t, "supersecret")
+	req := httptest.NewRequest(http.MethodGet, "/webhooks/subscriptions/", nil)
+	req.Header.Set("Authorization", "Bearer supersecret")
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+	if rr.Code == http.StatusUnauthorized {
+		t.Fatalf("expected non-401 with correct token, got 401")
+	}
+}
+
+// TestAdminAuthMiddleware_GetRequiresAuthToo verifies that GET requests (which
+// site AuthMiddleware allows without auth) are also gated by AdminAuthMiddleware.
+func TestAdminAuthMiddleware_GetRequiresAuthToo(t *testing.T) {
+	router := openTestAdminRouter(t, "adminkey")
+	req := httptest.NewRequest(http.MethodGet, "/webhooks/dlq/", nil)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("GET /webhooks/dlq/ without token: status = %d, want 401", rr.Code)
 	}
 }

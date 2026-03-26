@@ -51,7 +51,7 @@ func newSubRouter(t *testing.T, sp *webhooks.StoreProvider) http.Handler {
 	t.Helper()
 	stores := storage.NewRegistry()
 	t.Cleanup(func() { stores.CloseAll() })
-	return chihttp.NewRouter(makeTestRegistry(t), stores, nil, nil, nil, sp)
+	return chihttp.NewRouter(makeTestRegistry(t), stores, nil, nil, nil, sp, "")
 }
 
 // --- GET /webhooks/subscriptions/ ---

@@ -58,6 +58,7 @@ The server reads the site registry from `contracts/shared/sites.yaml` on startup
 | `AIISTECH_WEBHOOK_TOKEN` | *(unset)* | Bearer token for the PhaseMirror-HQ subscription API |
 | `AIISTECH_WEBHOOK_STORE_PROVIDER` | *(unset)* | Set to `true` to enable `StoreProvider` (local bbolt subscriptions) |
 | `AIISTECH_WEBHOOK_SUBSCRIPTIONS_DB` | `var/state/webhooks/subscriptions.db` | bbolt database path for local subscriptions and DLQ |
+| `AIISTECH_ADMIN_API_KEY` | *(unset)* | Bearer token protecting `/webhooks/dlq/*` and `/webhooks/subscriptions/*`; when unset those routes are unauthenticated (a startup warning is logged) |
 
 ## Project Structure
 
@@ -456,7 +457,39 @@ Triggers on every push and pull-request to any branch. Three sequential steps mu
 
 ## Roadmap
 
-There are no further planned segments at this time.
+All planned segments are complete. The project is production-ready.
+
+---
+
+### Segment 40 — Security Hardening
+
+> Harden the server's security posture before final release.
+
+- **Timing-safe token comparison** — `AuthMiddleware` now uses
+  `crypto/subtle.ConstantTimeCompare` for all Bearer-token checks, eliminating
+  the timing side-channel present in plain string equality.
+
+- **Admin API key** (`AIISTECH_ADMIN_API_KEY`) — the DLQ management and
+  subscription management endpoints are now gated by a dedicated Bearer key.
+  Unlike site auth, **every method** (including `GET`) requires authentication
+  because listing subscriptions and DLQ records is equally sensitive.  When the
+  variable is unset the routes remain accessible and a `WARN` is logged at
+  startup.
+
+  ```bash
+  export AIISTECH_ADMIN_API_KEY=changeme
+  # All /webhooks/dlq/* and /webhooks/subscriptions/* requests now require:
+  #   Authorization: Bearer changeme
+  ```
+
+- **Security response headers** — `SecurityHeadersMiddleware` is applied
+  globally and sets `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
+  `X-XSS-Protection: 0`, and `Referrer-Policy: strict-origin-when-cross-origin`
+  on every response.
+
+- **Request body size cap** — `MaxBytesMiddleware` caps incoming request bodies
+  at **1 MiB** using `http.MaxBytesReader`, preventing resource exhaustion from
+  oversized payloads.
 
 ---
 
