@@ -76,6 +76,7 @@ func main() {
 	useStore := os.Getenv("AIISTECH_WEBHOOK_STORE_PROVIDER") == "true"
 
 	var disp webhooks.Dispatcher
+	var dlqStore *webhooks.DLQStore
 
 	switch {
 	case webhookBase != "" && useStore:
@@ -84,7 +85,11 @@ func main() {
 		remote := webhooks.NewRemoteProvider(webhookBase, os.Getenv("AIISTECH_WEBHOOK_TOKEN"), 0)
 		store := webhooks.NewStoreProvider(subsStore)
 		provider := webhooks.NewMultiProvider(store, remote)
-		wd := webhooks.NewWorkerDispatcher(webhooks.Config{ServiceName: serviceName}, provider)
+		dlqStore = webhooks.NewDLQStore(subsStore)
+		wd := webhooks.NewWorkerDispatcher(webhooks.Config{
+			ServiceName: serviceName,
+			DLQStore:    dlqStore,
+		}, provider)
 		disp = wd
 		slog.Info("webhook dispatcher started (multi-provider)",
 			"service", serviceName,
@@ -106,7 +111,11 @@ func main() {
 		// StoreProvider only: local bbolt subscriptions, no remote.
 		subsStore := openWebhookSubscriptionsStore()
 		provider := webhooks.NewStoreProvider(subsStore)
-		wd := webhooks.NewWorkerDispatcher(webhooks.Config{ServiceName: serviceName}, provider)
+		dlqStore = webhooks.NewDLQStore(subsStore)
+		wd := webhooks.NewWorkerDispatcher(webhooks.Config{
+			ServiceName: serviceName,
+			DLQStore:    dlqStore,
+		}, provider)
 		disp = wd
 		slog.Info("webhook dispatcher started (store-provider)",
 			"service", serviceName,
@@ -119,7 +128,14 @@ func main() {
 		addr = v
 	}
 
-	router := sitehttp.NewRouter(reg, stores, disp)
+	// Wire the DLQ replayer: WorkerDispatcher implements DLQReplayer when
+	// cast via the Dispatcher interface. We need the concrete type.
+	var dlqReplayer webhooks.DLQReplayer
+	if wd, ok := disp.(*webhooks.WorkerDispatcher); ok {
+		dlqReplayer = wd
+	}
+
+	router := sitehttp.NewRouter(reg, stores, disp, dlqStore, dlqReplayer)
 
 	srv := &http.Server{
 		Addr:    addr,
@@ -169,7 +185,7 @@ func subsDBPath() string {
 // openWebhookSubscriptionsStore opens the bbolt database for webhook
 // subscriptions, creating parent directories as needed.
 // It exits the process on error.
-func openWebhookSubscriptionsStore() *storage.BBoltStore {
+func openWebhookSubscriptionsStore() storage.Store {
 	path := subsDBPath()
 	s, err := storage.Open(path)
 	if err != nil {

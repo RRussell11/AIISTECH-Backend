@@ -39,7 +39,7 @@ func newRouter(t *testing.T) http.Handler {
 	t.Helper()
 	stores := storage.NewRegistry()
 	t.Cleanup(func() { stores.CloseAll() })
-	return chihttp.NewRouter(makeTestRegistry(t), stores, nil)
+	return chihttp.NewRouter(makeTestRegistry(t), stores, nil, nil, nil)
 }
 
 // do performs an HTTP request against the router and returns the response recorder.

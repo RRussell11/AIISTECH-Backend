@@ -65,4 +65,26 @@ type Config struct {
 	// exponential back-off (1 s, 2 s, 4 s … capped at 30 s).
 	// Override in tests to avoid real sleeps.
 	RetryBackoff func(attempt int) time.Duration
+
+	// DLQStore is the dead-letter queue store used to persist events that
+	// have exhausted all delivery attempts. When nil, failed deliveries are
+	// only logged and not stored for later replay.
+	DLQStore *DLQStore
+
+	// DLQCoolingOff is the minimum wait time before the auto-retry scheduler
+	// will attempt to replay a newly-stored DLQ record.
+	// Zero or negative values fall back to the default (5 minutes).
+	DLQCoolingOff time.Duration
+
+	// DLQScanInterval controls how often the auto-retry scheduler wakes up
+	// to check for eligible DLQ records.
+	// Zero or negative values fall back to the default (60 seconds).
+	// The auto-retry scheduler is only started when DLQStore is non-nil.
+	DLQScanInterval time.Duration
+
+	// DLQMaxAttempts is the maximum number of replay attempts after which a
+	// DLQ record is considered terminal and will no longer be auto-retried.
+	// Manual replay via the HTTP endpoint is still possible.
+	// Zero or negative values fall back to the default (10).
+	DLQMaxAttempts int
 }

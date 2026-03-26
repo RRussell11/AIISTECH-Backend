@@ -57,7 +57,7 @@ The server reads the site registry from `contracts/shared/sites.yaml` on startup
 | `AIISTECH_WEBHOOK_BASE_URL` | *(unset)* | PhaseMirror-HQ base URL — enables `RemoteProvider` |
 | `AIISTECH_WEBHOOK_TOKEN` | *(unset)* | Bearer token for the PhaseMirror-HQ subscription API |
 | `AIISTECH_WEBHOOK_STORE_PROVIDER` | *(unset)* | Set to `true` to enable `StoreProvider` (local bbolt subscriptions) |
-| `AIISTECH_WEBHOOK_SUBSCRIPTIONS_DB` | `var/state/webhooks/subscriptions.db` | bbolt database path for local subscriptions |
+| `AIISTECH_WEBHOOK_SUBSCRIPTIONS_DB` | `var/state/webhooks/subscriptions.db` | bbolt database path for local subscriptions and DLQ |
 
 ## Project Structure
 
@@ -457,6 +457,82 @@ Triggers on every push and pull-request to any branch. Three sequential steps mu
 ## Roadmap
 
 There are no further planned segments at this time.
+
+---
+
+### Segment 37 — MultiProvider & Event-Type Filtering
+
+> Unify local and remote webhook subscriptions. Add `"*"` wildcard event-type filter.
+
+- **`AIISTECH_WEBHOOK_STORE_PROVIDER=true`** enables a local bbolt-backed subscription store.
+- **`AIISTECH_WEBHOOK_BASE_URL`** + **`AIISTECH_WEBHOOK_STORE_PROVIDER=true`** enables `MultiProvider` (both sources merged and deduplicated).
+- `Events: ["*"]` or empty `Events` in a subscription matches all event types (case-sensitive matching).
+
+---
+
+### Segment 38 — Dead-Letter Queue (DLQ) & Replay
+
+> Failed webhook deliveries are persisted in a DLQ and can be replayed manually or automatically.
+
+The DLQ is enabled automatically when `AIISTECH_WEBHOOK_STORE_PROVIDER=true` (or `MultiProvider`).
+All endpoints are mounted at `/webhooks/dlq/`.
+
+#### `GET /webhooks/dlq/`
+List all DLQ records. Supports `?cursor=` and `?limit=` pagination.
+
+```
+curl http://localhost:8080/webhooks/dlq/
+# {"records":[...],"next_cursor":""}
+```
+
+#### `GET /webhooks/dlq/{id}`
+Get a specific DLQ record.
+
+```
+curl http://localhost:8080/webhooks/dlq/1234567890.json
+# {"id":"...","subscription_url":"...","event":{"id":"...","type":"audit.write",...},...}
+```
+
+#### `DELETE /webhooks/dlq/{id}`
+Remove a DLQ record (cancel / discard). Returns `204 No Content`.
+
+```
+curl -X DELETE http://localhost:8080/webhooks/dlq/1234567890.json
+# HTTP 204
+```
+
+#### `POST /webhooks/dlq/{id}/replay`
+Replay a single DLQ record. On success the record is deleted and `200` is returned.
+On failure `502 Bad Gateway` is returned and the record is updated with the new error.
+
+```
+curl -X POST http://localhost:8080/webhooks/dlq/1234567890.json/replay
+# {"id":"1234567890.json","status":"delivered"}
+# or on failure:
+# {"error":"...","id":"1234567890.json","status":"failed"}
+```
+
+#### `POST /webhooks/dlq/replay-all`
+Replay all DLQ records concurrently (up to 8 goroutines). Returns a summary.
+
+```
+curl -X POST http://localhost:8080/webhooks/dlq/replay-all
+# {"failed":0,"results":[...],"succeeded":2,"total":2}
+```
+
+**Expvar metrics for DLQ** (visible at `GET /metrics`):
+
+| Key | Description |
+|---|---|
+| `webhook_dlq_stored_total` | Total records written to the DLQ |
+| `webhook_dlq_replay_success_total` | Total records successfully replayed |
+| `webhook_dlq_replay_failure_total` | Total replay attempts that failed |
+
+**Auto-retry scheduler:** When the DLQ store is configured, a background goroutine
+scans every 60 seconds for eligible records (`NextRetryAfter ≤ now`) and replays
+them automatically with exponential back-off (base 5 min, doubles per attempt, capped
+at 24 h). Records that exceed 10 replay attempts are marked terminal and skipped by
+the scheduler (manual replay is still possible).
 
 ---
 

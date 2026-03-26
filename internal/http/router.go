@@ -14,7 +14,15 @@ import (
 // NewRouter builds and returns the application HTTP router.
 // disp may be nil; when non-nil it receives an "audit.write" webhook event
 // for every state-mutating request processed by AuditMiddleware.
-func NewRouter(reg *site.Registry, stores *storage.Registry, disp webhooks.Dispatcher) http.Handler {
+// dlqStore and dlqReplayer may be nil; when both are non-nil the DLQ management
+// endpoints are mounted at /webhooks/dlq.
+func NewRouter(
+	reg *site.Registry,
+	stores *storage.Registry,
+	disp webhooks.Dispatcher,
+	dlqStore *webhooks.DLQStore,
+	dlqReplayer webhooks.DLQReplayer,
+) http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.RequestID) // injects X-Request-Id for audit traceability
@@ -26,6 +34,17 @@ func NewRouter(reg *site.Registry, stores *storage.Registry, disp webhooks.Dispa
 	r.Get("/healthz/ready", ReadyzHandler(reg)) // readiness probe: registry loaded
 	r.Get("/metrics", MetricsHandler)
 	r.Get("/sites", ListSitesHandler(reg))
+
+	// DLQ management routes — only mounted when a DLQ store is configured.
+	if dlqStore != nil && dlqReplayer != nil {
+		r.Route("/webhooks/dlq", func(r chi.Router) {
+			r.Get("/", ListDLQHandler(dlqStore))
+			r.Post("/replay-all", ReplayAllDLQHandler(dlqStore, dlqReplayer))
+			r.Get("/{id}", GetDLQHandler(dlqStore))
+			r.Delete("/{id}", DeleteDLQHandler(dlqStore))
+			r.Post("/{id}/replay", ReplayDLQHandler(dlqStore, dlqReplayer))
+		})
+	}
 
 	// Site-scoped routes
 	r.Route("/sites/{site_id}", func(r chi.Router) {

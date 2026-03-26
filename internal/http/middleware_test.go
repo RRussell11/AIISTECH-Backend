@@ -41,7 +41,7 @@ func newRouterWithDispatcher(t *testing.T, disp webhooks.Dispatcher) http.Handle
 	t.Helper()
 	stores := storage.NewRegistry()
 	t.Cleanup(func() { stores.CloseAll() })
-	return chihttp.NewRouter(makeTestRegistry(t), stores, disp)
+	return chihttp.NewRouter(makeTestRegistry(t), stores, disp, nil, nil)
 }
 
 // TestAuditMiddleware_DispatchFiredOnPost verifies that a POST request causes
