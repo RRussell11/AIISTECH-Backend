@@ -272,6 +272,39 @@ func TestWorkerDispatcher_WildcardSubscription(t *testing.T) {
 	}
 }
 
+func TestWorkerDispatcher_StarWildcardSubscription(t *testing.T) {
+	var calls atomic.Int32
+
+	receiver := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer receiver.Close()
+
+	// Events: ["*"] means "receive all event types" (explicit wildcard).
+	provider := &staticProvider{subs: []webhooks.Subscription{
+		{ID: "sub-star", URL: receiver.URL, Enabled: true, Events: []string{"*"}},
+	}}
+	d := webhooks.NewWorkerDispatcher(webhooks.Config{
+		ServiceName:    "aiistech-backend",
+		MaxAttempts:    3,
+		WorkerCount:    1,
+		TimeoutSeconds: 5,
+		RetryBackoff:   noBackoff,
+	}, provider)
+
+	if err := d.Dispatch(context.Background(), webhooks.Event{ID: "evt-star", Type: "some.other.event"}); err != nil {
+		t.Fatalf("Dispatch() error = %v", err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	if n := calls.Load(); n != 1 {
+		t.Errorf("expected 1 delivery for \"*\" wildcard subscription, got %d", n)
+	}
+}
+
 func TestWorkerDispatcher_NoSignatureWhenNoSecret(t *testing.T) {
 	var gotSig string
 

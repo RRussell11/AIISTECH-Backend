@@ -53,6 +53,11 @@ The server reads the site registry from `contracts/shared/sites.yaml` on startup
 | `AIISTECH_ADDR` | `:8080` | Listen address |
 | `AIISTECH_REGISTRY_PATH` | `contracts/shared/sites.yaml` | Path to site registry file |
 | `AIISTECH_LOG_LEVEL` | `INFO` | Structured log verbosity (`DEBUG`, `INFO`, `WARN`, `ERROR`) |
+| `AIISTECH_SERVICE_NAME` | `aiistech-backend` | Logical service name sent to the subscription API |
+| `AIISTECH_WEBHOOK_BASE_URL` | *(unset)* | PhaseMirror-HQ base URL — enables `RemoteProvider` |
+| `AIISTECH_WEBHOOK_TOKEN` | *(unset)* | Bearer token for the PhaseMirror-HQ subscription API |
+| `AIISTECH_WEBHOOK_STORE_PROVIDER` | *(unset)* | Set to `true` to enable `StoreProvider` (local bbolt subscriptions) |
+| `AIISTECH_WEBHOOK_SUBSCRIPTIONS_DB` | `var/state/webhooks/subscriptions.db` | bbolt database path for local subscriptions |
 
 ## Project Structure
 

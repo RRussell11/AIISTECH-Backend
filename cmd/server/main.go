@@ -20,6 +20,10 @@ import (
 const defaultRegistryPath = "contracts/shared/sites.yaml"
 const defaultAddr = ":8080"
 
+// defaultWebhookSubscriptionsDB is the path used for the webhook subscriptions
+// bbolt database when AIISTECH_WEBHOOK_SUBSCRIPTIONS_DB is not set.
+const defaultWebhookSubscriptionsDB = "var/state/webhooks/subscriptions.db"
+
 func main() {
 	// Configure structured logging level from AIISTECH_LOG_LEVEL (DEBUG/INFO/WARN/ERROR).
 	logLevel := new(slog.LevelVar) // defaults to INFO
@@ -48,22 +52,66 @@ func main() {
 
 	stores := storage.NewRegistry()
 
-	// Webhook dispatcher — optional. Configure via env vars:
-	//   AIISTECH_WEBHOOK_BASE_URL  — PhaseMirror-HQ subscriptions base URL
-	//   AIISTECH_WEBHOOK_TOKEN     — bearer token for subscription API (optional)
-	//   AIISTECH_SERVICE_NAME      — logical service name (default: "aiistech-backend")
+	// Webhook dispatcher — optional.  Configure via env vars:
+	//
+	//   AIISTECH_WEBHOOK_BASE_URL            — PhaseMirror-HQ subscriptions base URL
+	//                                          (enables RemoteProvider)
+	//   AIISTECH_WEBHOOK_TOKEN               — bearer token for subscription API (optional)
+	//   AIISTECH_SERVICE_NAME                — logical service name (default: "aiistech-backend")
+	//   AIISTECH_WEBHOOK_STORE_PROVIDER=true — enable StoreProvider (local bbolt subscriptions)
+	//   AIISTECH_WEBHOOK_SUBSCRIPTIONS_DB    — path to bbolt db for local subscriptions
+	//                                          (default: var/state/webhooks/subscriptions.db)
+	//
+	// Provider selection rules:
+	//   - Both URL and STORE_PROVIDER set → MultiProvider (union, deduplicated)
+	//   - Only URL set                    → RemoteProvider
+	//   - Only STORE_PROVIDER=true        → StoreProvider
+	//   - Neither                         → no dispatcher (webhooks disabled)
+	serviceName := os.Getenv("AIISTECH_SERVICE_NAME")
+	if serviceName == "" {
+		serviceName = "aiistech-backend"
+	}
+
+	webhookBase := os.Getenv("AIISTECH_WEBHOOK_BASE_URL")
+	useStore := os.Getenv("AIISTECH_WEBHOOK_STORE_PROVIDER") == "true"
+
 	var disp webhooks.Dispatcher
-	if webhookBase := os.Getenv("AIISTECH_WEBHOOK_BASE_URL"); webhookBase != "" {
-		serviceName := os.Getenv("AIISTECH_SERVICE_NAME")
-		if serviceName == "" {
-			serviceName = "aiistech-backend"
-		}
-		provider := webhooks.NewRemoteProvider(webhookBase, os.Getenv("AIISTECH_WEBHOOK_TOKEN"), 0)
-		wd := webhooks.NewWorkerDispatcher(webhooks.Config{
-			ServiceName: serviceName,
-		}, provider)
+
+	switch {
+	case webhookBase != "" && useStore:
+		// MultiProvider: query both sources and deliver to all active subscriptions.
+		subsStore := openWebhookSubscriptionsStore()
+		remote := webhooks.NewRemoteProvider(webhookBase, os.Getenv("AIISTECH_WEBHOOK_TOKEN"), 0)
+		store := webhooks.NewStoreProvider(subsStore)
+		provider := webhooks.NewMultiProvider(store, remote)
+		wd := webhooks.NewWorkerDispatcher(webhooks.Config{ServiceName: serviceName}, provider)
 		disp = wd
-		slog.Info("webhook dispatcher started", "service", serviceName, "base_url", webhookBase)
+		slog.Info("webhook dispatcher started (multi-provider)",
+			"service", serviceName,
+			"base_url", webhookBase,
+			"subscriptions_db", subsDBPath(),
+		)
+
+	case webhookBase != "":
+		// RemoteProvider only (backward-compatible default).
+		provider := webhooks.NewRemoteProvider(webhookBase, os.Getenv("AIISTECH_WEBHOOK_TOKEN"), 0)
+		wd := webhooks.NewWorkerDispatcher(webhooks.Config{ServiceName: serviceName}, provider)
+		disp = wd
+		slog.Info("webhook dispatcher started (remote-provider)",
+			"service", serviceName,
+			"base_url", webhookBase,
+		)
+
+	case useStore:
+		// StoreProvider only: local bbolt subscriptions, no remote.
+		subsStore := openWebhookSubscriptionsStore()
+		provider := webhooks.NewStoreProvider(subsStore)
+		wd := webhooks.NewWorkerDispatcher(webhooks.Config{ServiceName: serviceName}, provider)
+		disp = wd
+		slog.Info("webhook dispatcher started (store-provider)",
+			"service", serviceName,
+			"subscriptions_db", subsDBPath(),
+		)
 	}
 
 	addr := defaultAddr
@@ -108,4 +156,28 @@ func main() {
 	stores.CloseAll()
 	slog.Info("server stopped")
 }
+
+// subsDBPath returns the configured webhook subscriptions database path,
+// falling back to defaultWebhookSubscriptionsDB when the env var is not set.
+func subsDBPath() string {
+	if v := os.Getenv("AIISTECH_WEBHOOK_SUBSCRIPTIONS_DB"); v != "" {
+		return v
+	}
+	return defaultWebhookSubscriptionsDB
+}
+
+// openWebhookSubscriptionsStore opens the bbolt database for webhook
+// subscriptions, creating parent directories as needed.
+// It exits the process on error.
+func openWebhookSubscriptionsStore() *storage.BBoltStore {
+	path := subsDBPath()
+	s, err := storage.Open(path)
+	if err != nil {
+		slog.Error("failed to open webhook subscriptions store", "path", path, "error", err)
+		fmt.Fprintf(os.Stderr, "fatal: %v\n", err)
+		os.Exit(1)
+	}
+	return s
+}
+
 

@@ -138,14 +138,21 @@ func (d *WorkerDispatcher) process(evt Event) {
 	}
 }
 
-// matchesEventType reports whether sub has an empty Events slice (wildcard) or
-// explicitly lists eventType.
+// matchesEventType reports whether sub should receive an event of eventType.
+//
+// Rules (evaluated in order):
+//  1. Empty Events slice — subscribe to all event types (catch-all).
+//  2. Any element equals "*" — explicit wildcard; subscribes to all types.
+//  3. Any element equals eventType (case-sensitive) — explicit match.
+//
+// Comparisons are case-sensitive; callers are responsible for normalising
+// event type strings before calling Dispatch.
 func matchesEventType(sub Subscription, eventType string) bool {
 	if len(sub.Events) == 0 {
 		return true
 	}
 	for _, e := range sub.Events {
-		if e == eventType {
+		if e == "*" || e == eventType {
 			return true
 		}
 	}
