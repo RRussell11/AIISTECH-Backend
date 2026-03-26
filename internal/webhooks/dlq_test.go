@@ -3,6 +3,7 @@ package webhooks_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -143,7 +144,7 @@ func TestDLQStore_List(t *testing.T) {
 	d := openDLQStore(t)
 
 	for i := range 3 {
-		rec := newTestDLQRecord("evt-list-"+string(rune('0'+i)), "sub-"+string(rune('0'+i)), "https://example.com/hook")
+		rec := newTestDLQRecord("evt-list-"+fmt.Sprintf("%d", i), "sub-"+fmt.Sprintf("%d", i), "https://example.com/hook")
 		if err := d.Save(rec); err != nil {
 			t.Fatalf("Save() error = %v", err)
 		}
@@ -173,7 +174,7 @@ func TestDLQStore_ListPage(t *testing.T) {
 	d := openDLQStore(t)
 
 	for i := range 5 {
-		rec := newTestDLQRecord("evt-page-"+string(rune('a'+i)), "sub-"+string(rune('a'+i)), "https://example.com/hook")
+		rec := newTestDLQRecord("evt-page-"+fmt.Sprintf("%d", i), "sub-"+fmt.Sprintf("%d", i), "https://example.com/hook")
 		rec.ID = "" // let Save assign a key
 		if err := d.Save(rec); err != nil {
 			t.Fatalf("Save() error = %v", err)

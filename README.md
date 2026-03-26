@@ -536,6 +536,59 @@ the scheduler (manual replay is still possible).
 
 ---
 
+### Segment 39 — Subscription Management HTTP API
+
+> Manage webhook subscriptions at runtime via HTTP — no server restart required.
+
+Subscription routes are mounted at `/webhooks/subscriptions/` only when
+`AIISTECH_WEBHOOK_STORE_PROVIDER=true`.
+
+#### `GET /webhooks/subscriptions/`
+List all subscriptions with cursor pagination.
+
+```
+curl http://localhost:8080/webhooks/subscriptions/
+# {"subscriptions":[...],"next_cursor":""}
+```
+
+#### `POST /webhooks/subscriptions/`
+Create a new subscription. `service` and `url` are required.
+
+```
+curl -X POST http://localhost:8080/webhooks/subscriptions/ \
+  -H 'Content-Type: application/json' \
+  -d '{"service":"aiistech-backend","url":"https://example.com/hook","events":["audit.write"]}'
+# HTTP 201
+# {"id":"sub_<ns>","service":"aiistech-backend","url":"...","enabled":true,...}
+```
+
+#### `GET /webhooks/subscriptions/{id}`
+Get a specific subscription.
+
+```
+curl http://localhost:8080/webhooks/subscriptions/sub_12345
+```
+
+#### `PATCH /webhooks/subscriptions/{id}`
+Partially update a subscription. Only provided fields are changed.
+
+```
+curl -X PATCH http://localhost:8080/webhooks/subscriptions/sub_12345 \
+  -H 'Content-Type: application/json' \
+  -d '{"enabled":false,"events":["audit.write","artifact.write"]}'
+# HTTP 200 — returns full updated subscription
+```
+
+#### `DELETE /webhooks/subscriptions/{id}`
+Delete a subscription. Returns `204 No Content`.
+
+```
+curl -X DELETE http://localhost:8080/webhooks/subscriptions/sub_12345
+# HTTP 204
+```
+
+---
+
 ## Tests
 
 ```bash

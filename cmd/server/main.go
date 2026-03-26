@@ -77,14 +77,15 @@ func main() {
 
 	var disp webhooks.Dispatcher
 	var dlqStore *webhooks.DLQStore
+	var storeProvider *webhooks.StoreProvider
 
 	switch {
 	case webhookBase != "" && useStore:
 		// MultiProvider: query both sources and deliver to all active subscriptions.
 		subsStore := openWebhookSubscriptionsStore()
 		remote := webhooks.NewRemoteProvider(webhookBase, os.Getenv("AIISTECH_WEBHOOK_TOKEN"), 0)
-		store := webhooks.NewStoreProvider(subsStore)
-		provider := webhooks.NewMultiProvider(store, remote)
+		storeProvider = webhooks.NewStoreProvider(subsStore)
+		provider := webhooks.NewMultiProvider(storeProvider, remote)
 		dlqStore = webhooks.NewDLQStore(subsStore)
 		wd := webhooks.NewWorkerDispatcher(webhooks.Config{
 			ServiceName: serviceName,
@@ -110,12 +111,12 @@ func main() {
 	case useStore:
 		// StoreProvider only: local bbolt subscriptions, no remote.
 		subsStore := openWebhookSubscriptionsStore()
-		provider := webhooks.NewStoreProvider(subsStore)
+		storeProvider = webhooks.NewStoreProvider(subsStore)
 		dlqStore = webhooks.NewDLQStore(subsStore)
 		wd := webhooks.NewWorkerDispatcher(webhooks.Config{
 			ServiceName: serviceName,
 			DLQStore:    dlqStore,
-		}, provider)
+		}, storeProvider)
 		disp = wd
 		slog.Info("webhook dispatcher started (store-provider)",
 			"service", serviceName,
@@ -135,7 +136,7 @@ func main() {
 		dlqReplayer = wd
 	}
 
-	router := sitehttp.NewRouter(reg, stores, disp, dlqStore, dlqReplayer)
+	router := sitehttp.NewRouter(reg, stores, disp, dlqStore, dlqReplayer, storeProvider)
 
 	srv := &http.Server{
 		Addr:    addr,

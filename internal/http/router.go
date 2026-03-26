@@ -16,12 +16,15 @@ import (
 // for every state-mutating request processed by AuditMiddleware.
 // dlqStore and dlqReplayer may be nil; when both are non-nil the DLQ management
 // endpoints are mounted at /webhooks/dlq.
+// storeProvider may be nil; when non-nil the subscription management endpoints
+// are mounted at /webhooks/subscriptions.
 func NewRouter(
 	reg *site.Registry,
 	stores *storage.Registry,
 	disp webhooks.Dispatcher,
 	dlqStore *webhooks.DLQStore,
 	dlqReplayer webhooks.DLQReplayer,
+	storeProvider *webhooks.StoreProvider,
 ) http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.Recoverer)
@@ -43,6 +46,17 @@ func NewRouter(
 			r.Get("/{id}", GetDLQHandler(dlqStore))
 			r.Delete("/{id}", DeleteDLQHandler(dlqStore))
 			r.Post("/{id}/replay", ReplayDLQHandler(dlqStore, dlqReplayer))
+		})
+	}
+
+	// Subscription management routes — only mounted when a StoreProvider is configured.
+	if storeProvider != nil {
+		r.Route("/webhooks/subscriptions", func(r chi.Router) {
+			r.Get("/", ListSubscriptionsHandler(storeProvider))
+			r.Post("/", CreateSubscriptionHandler(storeProvider))
+			r.Get("/{id}", GetSubscriptionHandler(storeProvider))
+			r.Patch("/{id}", PatchSubscriptionHandler(storeProvider))
+			r.Delete("/{id}", DeleteSubscriptionHandler(storeProvider))
 		})
 	}
 

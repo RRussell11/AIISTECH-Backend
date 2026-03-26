@@ -67,7 +67,7 @@ func newDLQRouter(t *testing.T, dlq *webhooks.DLQStore, replayer webhooks.DLQRep
 	t.Helper()
 	stores := storage.NewRegistry()
 	t.Cleanup(func() { stores.CloseAll() })
-	return chihttp.NewRouter(makeTestRegistry(t), stores, nil, dlq, replayer)
+	return chihttp.NewRouter(makeTestRegistry(t), stores, nil, dlq, replayer, nil)
 }
 
 // --- GET /webhooks/dlq ---
