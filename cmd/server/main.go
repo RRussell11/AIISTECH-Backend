@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"expvar"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -23,6 +24,11 @@ const defaultAddr = ":8080"
 // defaultWebhookSubscriptionsDB is the path used for the webhook subscriptions
 // bbolt database when AIISTECH_WEBHOOK_SUBSCRIPTIONS_DB is not set.
 const defaultWebhookSubscriptionsDB = "var/state/webhooks/subscriptions.db"
+
+var (
+	metricWebhookDispatcherEnabled = expvar.NewInt("webhook_dispatcher_enabled")
+	metricWebhookDispatcherMode    = expvar.NewString("webhook_dispatcher_mode") // none|remote|store|multi
+)
 
 func main() {
 	// Configure structured logging level from AIISTECH_LOG_LEVEL (DEBUG/INFO/WARN/ERROR).
@@ -75,6 +81,15 @@ func main() {
 	webhookBase := os.Getenv("AIISTECH_WEBHOOK_BASE_URL")
 	useStore := os.Getenv("AIISTECH_WEBHOOK_STORE_PROVIDER") == "true"
 
+	// Default: webhooks disabled until a dispatcher is successfully constructed.
+	metricWebhookDispatcherEnabled.Set(0)
+	metricWebhookDispatcherMode.Set("none")
+	if webhookBase == "" && !useStore {
+		slog.Warn("webhooks disabled",
+			"hint", "set AIISTECH_WEBHOOK_BASE_URL and/or AIISTECH_WEBHOOK_STORE_PROVIDER=true to enable webhook delivery",
+		)
+	}
+
 	var disp webhooks.Dispatcher
 	var dlqStore *webhooks.DLQStore
 	var storeProvider *webhooks.StoreProvider
@@ -92,6 +107,8 @@ func main() {
 			DLQStore:    dlqStore,
 		}, provider)
 		disp = wd
+		metricWebhookDispatcherEnabled.Set(1)
+		metricWebhookDispatcherMode.Set("multi")
 		slog.Info("webhook dispatcher started (multi-provider)",
 			"service", serviceName,
 			"base_url", webhookBase,
@@ -103,6 +120,8 @@ func main() {
 		provider := webhooks.NewRemoteProvider(webhookBase, os.Getenv("AIISTECH_WEBHOOK_TOKEN"), 0)
 		wd := webhooks.NewWorkerDispatcher(webhooks.Config{ServiceName: serviceName}, provider)
 		disp = wd
+		metricWebhookDispatcherEnabled.Set(1)
+		metricWebhookDispatcherMode.Set("remote")
 		slog.Info("webhook dispatcher started (remote-provider)",
 			"service", serviceName,
 			"base_url", webhookBase,
@@ -118,6 +137,8 @@ func main() {
 			DLQStore:    dlqStore,
 		}, storeProvider)
 		disp = wd
+		metricWebhookDispatcherEnabled.Set(1)
+		metricWebhookDispatcherMode.Set("store")
 		slog.Info("webhook dispatcher started (store-provider)",
 			"service", serviceName,
 			"subscriptions_db", subsDBPath(),
