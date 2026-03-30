@@ -24,6 +24,7 @@ All stateful operations are scoped by an explicit `site_id`.
   - [Segment 9 — Pagination](#segment-9--pagination)
 - [Roadmap](#roadmap)
 - [Tests](#tests)
+- [Deployment (GitHub Actions)](#deployment-github-actions)
 
 ---
 
@@ -647,3 +648,122 @@ curl -X DELETE http://localhost:8080/webhooks/subscriptions/sub_12345
 ```bash
 go test ./...
 ```
+
+---
+
+## Deployment (GitHub Actions)
+
+Two deployment workflows are provided under `.github/workflows/`. Both trigger on **push to `main`** and gate the deploy job behind the `production` GitHub Environment (supporting required reviewers and admin bypass).
+
+### GitHub Environment setup
+
+1. In your repository go to **Settings → Environments → New environment** and name it `production`.
+2. Add **Required reviewers** (at least 1) and, if desired, enable **"Allow administrators to bypass configured protection rules"**.
+3. Add the secrets listed below **to the environment** (preferred) or as repository secrets.
+
+### Required secrets
+
+| Secret | Description |
+|---|---|
+| `PROD_SSH_HOST` | Public IP or DNS name of the production VM |
+| `PROD_SSH_USER` | SSH login user (e.g. `ubuntu`) |
+| `PROD_SSH_KEY` | Private SSH key used to authenticate (PEM format, full contents) |
+| `PROD_DEPLOY_PATH` | Absolute path on the VM where the repo / compose file lives (e.g. `/opt/aiistech-backend`) |
+| `AIISTECH_ADMIN_API_KEY` | Bearer token protecting `/webhooks/*` and `/metrics` — **never commit this value** |
+
+> ⚠️ **Never commit `.env` to the repository.** Never add `set -x` or `env` to any deploy script — doing so would print secrets to the workflow log.
+
+---
+
+### Option 1 — Build on the VM (`deploy-vm-build.yml`)
+
+Use this when you want the simplest possible pipeline with no container registry.
+
+**Jobs:**
+
+1. `ci` — runs `go vet`, `go test`, `go build`.
+2. `deploy-vm-build` (`needs: ci`, `environment: production`) — SSHes into the VM and runs:
+
+```bash
+cd "$DEPLOY_PATH"
+git fetch --all
+git checkout main
+git pull --ff-only
+docker compose up -d --build
+```
+
+**Minimal server setup:**
+
+```bash
+# Install Docker (Ubuntu 22.04)
+sudo apt-get update
+sudo apt-get install -y ca-certificates curl
+sudo install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | sudo tee /etc/apt/sources.list.d/docker.list
+sudo apt-get update
+sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+
+# Add deploy user to docker group (replace 'ubuntu' as needed)
+sudo usermod -aG docker ubuntu
+
+# Clone the repo
+sudo git clone https://github.com/RRussell11/AIISTECH-Backend.git /opt/aiistech-backend
+sudo chown -R ubuntu:ubuntu /opt/aiistech-backend
+
+# Create the .env file — never commit this
+cat > /opt/aiistech-backend/.env <<'EOF'
+AIISTECH_ADMIN_API_KEY=<your-secret-key>
+AIISTECH_WEBHOOK_BASE_URL=https://your-public-url
+AIISTECH_WEBHOOK_TOKEN=<openssl rand -hex 32>
+EOF
+chmod 600 /opt/aiistech-backend/.env
+```
+
+The existing `docker-compose.yml` (with `build:`) is used as-is for this option.
+
+---
+
+### Option 2 — Build in GitHub Actions, push to GHCR, VM pulls (`deploy-ghcr.yml`)
+
+Use this for immutable, reproducible images and faster server deploys.
+
+**Jobs:**
+
+1. `ci` — runs `go vet`, `go test`, `go build`.
+2. `build-and-push-image` (`needs: ci`) — builds the Docker image, logs into GHCR with `GITHUB_TOKEN`, and pushes two tags:
+   - `ghcr.io/rrussell11/aiistech-backend:main`
+   - `ghcr.io/rrussell11/aiistech-backend:sha-<shortsha>`
+3. `deploy-vm-pull` (`needs: build-and-push-image`, `environment: production`) — SSHes into the VM and runs:
+
+```bash
+cd "$DEPLOY_PATH"
+docker compose pull
+docker compose up -d
+```
+
+**Server-side `docker-compose.yml` for this option** — replace the `build:` block with an `image:` reference:
+
+```yaml
+services:
+  aiistech-backend:
+    image: ghcr.io/rrussell11/aiistech-backend:main
+    env_file:
+      - .env
+    environment:
+      AIISTECH_WEBHOOK_BASE_URL: ${AIISTECH_WEBHOOK_BASE_URL}
+      AIISTECH_WEBHOOK_TOKEN: ${AIISTECH_WEBHOOK_TOKEN}
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+```
+
+**Additional server-side step — authenticate to GHCR** (one-time, so the VM can `docker pull` the image):
+
+```bash
+# On the VM, log in with a GitHub Personal Access Token (read:packages scope)
+echo "$GHCR_PAT" | docker login ghcr.io -u <github-username> --password-stdin
+```
+
+The `.env` file setup is the same as Option 1 above.
+
