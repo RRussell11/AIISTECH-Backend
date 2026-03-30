@@ -339,3 +339,51 @@ func TestAdminAuthMiddleware_GetRequiresAuthToo(t *testing.T) {
 		t.Errorf("GET /webhooks/dlq/ without token: status = %d, want 401", rr.Code)
 	}
 }
+
+// --- Expvar endpoint gating (/metrics, /debug/vars) ---
+
+// TestExpvarEndpoints_NotMountedWhenNoKey verifies that /metrics and /debug/vars
+// return 404 when AIISTECH_ADMIN_API_KEY is not set.
+func TestExpvarEndpoints_NotMountedWhenNoKey(t *testing.T) {
+	router := openTestAdminRouter(t, "")
+	for _, path := range []string{"/metrics", "/debug/vars"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rr := httptest.NewRecorder()
+		router.ServeHTTP(rr, req)
+		if rr.Code != http.StatusNotFound {
+			t.Errorf("GET %s with no admin key: status = %d, want 404", path, rr.Code)
+		}
+	}
+}
+
+// TestExpvarEndpoints_RequireBearerToken verifies that /metrics and /debug/vars
+// return 401 when admin key is set but no Bearer token is provided.
+func TestExpvarEndpoints_RequireBearerToken(t *testing.T) {
+	router := openTestAdminRouter(t, "supersecret")
+	for _, path := range []string{"/metrics", "/debug/vars"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rr := httptest.NewRecorder()
+		router.ServeHTTP(rr, req)
+		if rr.Code != http.StatusUnauthorized {
+			t.Errorf("GET %s without token: status = %d, want 401", path, rr.Code)
+		}
+		if !strings.Contains(rr.Header().Get("WWW-Authenticate"), "Bearer") {
+			t.Errorf("GET %s: missing WWW-Authenticate Bearer challenge", path)
+		}
+	}
+}
+
+// TestExpvarEndpoints_AcceptCorrectToken verifies that /metrics and /debug/vars
+// return 200 when admin key is set and the correct Bearer token is supplied.
+func TestExpvarEndpoints_AcceptCorrectToken(t *testing.T) {
+	router := openTestAdminRouter(t, "supersecret")
+	for _, path := range []string{"/metrics", "/debug/vars"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Header.Set("Authorization", "Bearer supersecret")
+		rr := httptest.NewRecorder()
+		router.ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Errorf("GET %s with correct token: status = %d, want 200", path, rr.Code)
+		}
+	}
+}

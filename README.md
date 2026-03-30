@@ -78,7 +78,7 @@ The service listens on port **8080** inside the container, mapped to `8080` on t
 | `AIISTECH_WEBHOOK_TOKEN` | *(unset)* | Bearer token for the PhaseMirror-HQ subscription API |
 | `AIISTECH_WEBHOOK_STORE_PROVIDER` | *(unset)* | Set to `true` to enable `StoreProvider` (local bbolt subscriptions) |
 | `AIISTECH_WEBHOOK_SUBSCRIPTIONS_DB` | `var/state/webhooks/subscriptions.db` | bbolt database path for local subscriptions and DLQ |
-| `AIISTECH_ADMIN_API_KEY` | *(unset)* | Bearer token protecting `/webhooks/dlq/*` and `/webhooks/subscriptions/*`; when unset those routes are unauthenticated (a startup warning is logged) |
+| `AIISTECH_ADMIN_API_KEY` | *(unset)* | Bearer token protecting `/metrics`, `/debug/vars`, `/webhooks/dlq/*`, and `/webhooks/subscriptions/*`; when unset the expvar endpoints are not mounted (404) and the webhook admin routes are unauthenticated (a startup warning is logged) |
 
 ## Project Structure
 
@@ -327,8 +327,8 @@ curl http://localhost:8080/sites/local/healthz
 # {"site_id":"local","status":"ok"}
 ```
 
-#### `GET /metrics`
-Expvar-based request metrics (JSON). Key counters:
+#### `GET /metrics` and `GET /debug/vars`
+Expvar-based request metrics (JSON). **Both endpoints are only mounted when `AIISTECH_ADMIN_API_KEY` is set** — when the variable is unset they return `404`. When set, every request must include `Authorization: Bearer <key>`. Key counters:
 
 | Key | Type | Description |
 |---|---|---|
@@ -336,8 +336,15 @@ Expvar-based request metrics (JSON). Key counters:
 | `requests_by_site` | map | Request count broken down by `site_id` |
 
 ```
-curl http://localhost:8080/metrics
+# Set the admin key first:
+export AIISTECH_ADMIN_API_KEY=your-secret-key
+
+# Then call either path with the Bearer token:
+curl -H "Authorization: Bearer $AIISTECH_ADMIN_API_KEY" http://localhost:8080/metrics
 # {"requests_total":42,"requests_by_site":{"local":35,"staging":7},...}
+
+curl -H "Authorization: Bearer $AIISTECH_ADMIN_API_KEY" http://localhost:8080/debug/vars
+# same expvar JSON output
 ```
 
 ---
@@ -489,18 +496,29 @@ All planned segments are complete. The project is production-ready.
   `crypto/subtle.ConstantTimeCompare` for all Bearer-token checks, eliminating
   the timing side-channel present in plain string equality.
 
-- **Admin API key** (`AIISTECH_ADMIN_API_KEY`) — the DLQ management and
-  subscription management endpoints are now gated by a dedicated Bearer key.
-  Unlike site auth, **every method** (including `GET`) requires authentication
-  because listing subscriptions and DLQ records is equally sensitive.  When the
-  variable is unset the routes remain accessible and a `WARN` is logged at
-  startup.
+- **Admin API key** (`AIISTECH_ADMIN_API_KEY`) — the DLQ management,
+  subscription management, and expvar endpoints are now gated by a dedicated
+  Bearer key.  Unlike site auth, **every method** (including `GET`) requires
+  authentication because listing subscriptions, DLQ records, and process
+  internals is equally sensitive.  The expvar endpoints (`/metrics` and
+  `/debug/vars`) are **not mounted at all** when the variable is unset, ensuring
+  process internals are never publicly readable even when the server is
+  reachable.
 
   ```bash
-  export AIISTECH_ADMIN_API_KEY=changeme
-  # All /webhooks/dlq/* and /webhooks/subscriptions/* requests now require:
-  #   Authorization: Bearer changeme
+  # Generate a strong key once and keep it in your secrets manager:
+  export AIISTECH_ADMIN_API_KEY=$(openssl rand -hex 32)
+
+  # All admin routes now require: Authorization: Bearer <key>
+  curl -H "Authorization: Bearer $AIISTECH_ADMIN_API_KEY" http://localhost:8080/metrics
+  curl -H "Authorization: Bearer $AIISTECH_ADMIN_API_KEY" http://localhost:8080/debug/vars
+  curl -H "Authorization: Bearer $AIISTECH_ADMIN_API_KEY" http://localhost:8080/webhooks/dlq/
+  curl -H "Authorization: Bearer $AIISTECH_ADMIN_API_KEY" http://localhost:8080/webhooks/subscriptions/
   ```
+
+  > **Key handling:** never commit the key to source control. Store it as a
+  > GitHub Actions secret, Docker secret, Kubernetes secret, or in a dedicated
+  > secrets manager. See `.env.example` for local development guidance.
 
 - **Security response headers** — `SecurityHeadersMiddleware` is applied
   globally and sets `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,

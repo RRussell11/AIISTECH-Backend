@@ -657,9 +657,21 @@ func TestReadyz(t *testing.T) {
 }
 
 func TestMetrics(t *testing.T) {
-	rr := do(t, newRouter(t), http.MethodGet, "/metrics", nil)
+	// Without an admin key, /metrics must not be mounted (404).
+	routerNoKey := newRouter(t)
+	rrNoKey := do(t, routerNoKey, http.MethodGet, "/metrics", nil)
+	if rrNoKey.Code != http.StatusNotFound {
+		t.Fatalf("/metrics with no admin key: status = %d, want 404", rrNoKey.Code)
+	}
+
+	// With an admin key, /metrics must return 200 and expvar JSON.
+	routerWithKey := openTestAdminRouter(t, "testkey")
+	req, _ := http.NewRequest(http.MethodGet, "/metrics", nil)
+	req.Header.Set("Authorization", "Bearer testkey")
+	rr := httptest.NewRecorder()
+	routerWithKey.ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", rr.Code)
+		t.Fatalf("/metrics with correct token: status = %d, want 200", rr.Code)
 	}
 	var body map[string]any
 	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
