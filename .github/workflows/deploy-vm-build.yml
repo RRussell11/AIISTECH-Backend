@@ -1,0 +1,54 @@
+name: Deploy – Build on VM
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: true
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...
+
+      - name: Build
+        run: go build ./cmd/server
+
+  deploy-vm-build:
+    needs: ci
+    runs-on: ubuntu-latest
+    environment: production
+    permissions: {}
+
+    steps:
+      - name: SSH and deploy
+        uses: appleboy/ssh-action@v1.3.0
+        env:
+          DEPLOY_PATH: ${{ secrets.PROD_DEPLOY_PATH }}
+        with:
+          host: ${{ secrets.PROD_SSH_HOST }}
+          username: ${{ secrets.PROD_SSH_USER }}
+          key: ${{ secrets.PROD_SSH_KEY }}
+          envs: DEPLOY_PATH
+          script_stop: true
+          script: |
+            cd "$DEPLOY_PATH"
+            git fetch --all
+            git checkout main
+            git pull --ff-only
+            docker compose up -d --build
