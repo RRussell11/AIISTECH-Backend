@@ -18,8 +18,9 @@ import (
 // endpoints are mounted at /webhooks/dlq.
 // storeProvider may be nil; when non-nil the subscription management endpoints
 // are mounted at /webhooks/subscriptions.
-// adminAPIKey gates the DLQ and subscription management endpoints via
-// Authorization: Bearer when non-empty; if empty those routes are unrestricted.
+// adminAPIKey gates the DLQ, subscription management, and expvar debug endpoints
+// via Authorization: Bearer when non-empty; if empty those routes are unrestricted
+// (DLQ/subscriptions) or not mounted at all (/metrics, /debug/vars).
 func NewRouter(
 	reg *site.Registry,
 	stores *storage.Registry,
@@ -40,7 +41,13 @@ func NewRouter(
 	r.Get("/healthz", HealthzHandler)           // backward-compatible liveness
 	r.Get("/healthz/live", LivezHandler)        // explicit liveness probe
 	r.Get("/healthz/ready", ReadyzHandler(reg)) // readiness probe: registry loaded
-	r.Get("/metrics", MetricsHandler)
+	// Expvar endpoints — only mounted when AIISTECH_ADMIN_API_KEY is configured.
+	// Both /metrics and /debug/vars serve the same expvar JSON and are protected
+	// by AdminAuthMiddleware so that process internals are never publicly readable.
+	if adminAPIKey != "" {
+		r.With(AdminAuthMiddleware(adminAPIKey)).Get("/metrics", MetricsHandler)
+		r.With(AdminAuthMiddleware(adminAPIKey)).Get("/debug/vars", MetricsHandler)
+	}
 	r.Get("/sites", ListSitesHandler(reg))
 
 	// DLQ management routes — only mounted when a DLQ store is configured.
