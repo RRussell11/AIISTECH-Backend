@@ -6,7 +6,8 @@ All stateful operations are scoped by an explicit `site_id`.
 ## Table of Contents
 
 - [Requirements](#requirements)
-- [Quick Start](#quick-start)
+- [Quick Start — Linux / macOS](#quick-start--linux--macos)
+- [Quick Start — Windows (WSL2 + Docker Desktop)](#quick-start--windows-wsl2--docker-desktop)
 - [Docker Compose (Production)](#docker-compose-production)
 - [Environment Variables](#environment-variables)
 - [Project Structure](#project-structure)
@@ -31,7 +32,7 @@ All stateful operations are scoped by an explicit `site_id`.
 
 - Go 1.24+
 
-## Quick Start
+## Quick Start — Linux / macOS
 
 ```bash
 # Clone and enter the repo
@@ -46,6 +47,61 @@ go run ./cmd/server
 ```
 
 The server reads the site registry from `contracts/shared/sites.yaml` on startup and shuts down gracefully on `SIGINT`/`SIGTERM` with a 10-second drain window.
+
+## Quick Start — Windows (WSL2 + Docker Desktop)
+
+> **Full guide:** see [`docs/windows-docker-setup.md`](docs/windows-docker-setup.md)
+> for prerequisites, step-by-step setup, and troubleshooting.
+
+### Prerequisites
+- Windows 10 (21H2+) or Windows 11
+- **Windows Subsystem for Linux** and **Virtual Machine Platform** features enabled
+  (`Win+R` → `optionalfeatures`)
+- CPU virtualization enabled in BIOS (`systeminfo | findstr /i "Virtualization"` shows `Yes`)
+- Docker Desktop for Windows with the WSL2 backend
+
+### Steps
+
+**Option A — from WSL terminal (recommended):**
+```bash
+# In your WSL distro (e.g. Ubuntu), open a terminal
+cd /mnt/c/Users/<you>/AIISTECH-Backend   # or clone directly inside WSL
+cp .env.example .env
+bash scripts/dev.sh doctor   # pre-flight check
+bash scripts/dev.sh up
+```
+
+**Option B — from PowerShell:**
+```powershell
+cd C:\Users\<you>\AIISTECH-Backend
+Copy-Item .env.example .env
+.\scripts\dev.ps1 doctor     # pre-flight check
+.\scripts\dev.ps1 up
+```
+
+**Option C — from Git Bash (MINGW64):**
+```bash
+cd ~/AIISTECH-Backend
+cp .env.example .env
+bash scripts/dev.sh up
+```
+
+> **Important:** always run `docker compose` from the **repository root**
+> (the folder containing `docker-compose.yml`). Running it from your home
+> directory (`~`) produces `no configuration file provided: not found`.
+
+### Running the helper scripts
+
+The `scripts/dev.sh` (bash) and `scripts/dev.ps1` (PowerShell) helpers wrap
+`docker compose` with a friendly guard that tells you when you are in the wrong
+directory:
+
+| Command | What it does |
+|---|---|
+| `up` | `docker compose up -d --build` |
+| `down` | `docker compose down` |
+| `logs [service]` | `docker compose logs -f [service]` |
+| `doctor` | Checks Docker daemon, compose file, and `.env` |
 
 ## Docker Compose (Production)
 
